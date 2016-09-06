@@ -11,9 +11,7 @@ source.
 
 ## Dependencies
 
-ReDex depends on folly, glog, double-conversion, boost and zlib, and uses
-autoconf/automake for building.  Getting these dependences is easiest using a
-package manager.
+Getting these dependences is easiest using a package manager.
 
 ### Mac OS X
 
@@ -26,11 +24,11 @@ xcode-select --install
 Install dependences using homebrew:
 ```
 brew install autoconf automake libtool python3
-brew install boost double-conversion gflags glog libevent openssl
+brew install boost double-conversion gflags glog libevent openssl jsoncpp
 brew link openssl --force
 ```
 
-### Ubuntu 14.04 LTS
+### Ubuntu 14.04 LTS (64-bit)
 ```
 sudo apt-get install \
     g++ \
@@ -51,16 +49,16 @@ sudo apt-get install \
     binutils-dev \
     libjemalloc-dev \
     libssl-dev \
-    libiberty-dev
+    libiberty-dev \
+    libjsoncpp-dev
 ```
 
 ## Download, Build and Install
 
-Get ReDex and its submodules from GitHub:
+Get ReDex from GitHub:
 ```
 git clone https://github.com/facebook/redex.git
 cd redex
-git submodule update --init
 ```
 
 Now, build ReDex using autoconf and make.
@@ -87,6 +85,10 @@ redex path/to/your.apk -o path/to/output.apk
 ```
 With any luck, the result `output.apk` should be smaller and faster than the
 input.  Enjoy!
+
+# Documentation
+Right now we have a limited amount of [documentation](docs/README.md) which describes a few
+example Redex optimization passes as well as deployments of Redex (including Docker).
 
 # FAQ
 
@@ -126,13 +128,6 @@ appropriate args:
 -p [KEYPASS], --keypass [KEYPASS]
 ```
 
-## I'm getting "/usr/local/bin/redex-all: error while loading shared libraries: libfolly.so.57..."
-
-If you're on Linux, run:
-```
-sudo ldconfig
-```
-
 ## How does this compare to ProGuard?
 
 ReDex is conceptually similar to ProGuard, in that both optimize bytecode.
@@ -158,6 +153,15 @@ source.  We don't use it at Facebook and we have no plans to start.
 # More Information
 
 The blog [Optimizing Android bytecode with ReDex](https://code.facebook.com/posts/1480969635539475/optimizing-android-bytecode-with-redex) provides an overview of the Redex project.
+
+# Issues
+Issues on GitHub are assigned priorities which reflect their urgency and how soon they are
+likely to be addressed.
+* P0: Unbreak now! A serious issue which should have someone working on it right now.
+* P1: High Priority. An important issue that someone should be actively working on.
+* P2: Mid Priority. An important issue which is in the queue to be processed soon.
+* P3: Low Priority. An important issue which may get dealt with at a later date.
+* P4: Wishlist: An issue with merit but low priority which is up for grabs but likely to be pruned if not addressed after a reasonable period.
 
 # License
 

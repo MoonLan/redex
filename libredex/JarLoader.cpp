@@ -361,6 +361,9 @@ static bool parse_class(uint8_t *buffer) {
   uint16_t super = read16(buffer);
   uint16_t ifcount = read16(buffer);
   DexType *self = make_dextype_from_cref(cpool, clazz);
+  if (type_class(self)) {
+    return true;
+  }
   ClassCreator cc(self);
   cc.set_external();
   if (super != 0) {
@@ -610,7 +613,7 @@ static int jar_uncompress(Bytef *dest, uLongf *destLen, const Bytef *source,
 }
 
 static bool decompress_class(jar_entry &file, uint8_t *mapping,
-                             uint8_t *outbuffer, int bufsize) {
+                             uint8_t *outbuffer, ssize_t bufsize) {
   if (file.cd_entry.comp_method != kCompMethodDeflate) {
     fprintf(stderr, "Unknown compression method %d, Bailing\n",
             file.cd_entry.comp_method);
@@ -663,7 +666,7 @@ static bool process_jar_entries(std::vector<jar_entry> &files,
   ssize_t bufsize = kStartBufferSize;
   uint8_t *outbuffer = (uint8_t*)malloc(bufsize);
   static char classEndString[] = ".class";
-  static int classEndStringLen = strlen(classEndString);
+  static size_t classEndStringLen = strlen(classEndString);
   init_basic_types();
   for (auto &file : files) {
     if (file.cd_entry.ucomp_size == 0)
@@ -738,6 +741,9 @@ bool load_jar_file(const char *location) {
   }
   bool rv = process_jar(mapping, size);
   munmap(mapping, size);
+  if (!rv) {
+    fprintf(stderr, "Error processing jar: %s\n", location);
+  }
   return rv;
 }
 

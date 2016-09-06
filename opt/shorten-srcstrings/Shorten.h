@@ -15,5 +15,15 @@ class ShortenSrcStringsPass : public Pass {
  public:
   ShortenSrcStringsPass() : Pass("ShortenSrcStringsPass") {}
 
-  virtual void run_pass(DexClassesVector&, ConfigFiles&) override;
+  virtual void configure_pass(const PassConfig& pc) override {
+    pc.get(
+      "filename_mappings",
+      "/tmp/filename_mappings.txt",
+      m_filename_mappings);
+  }
+
+  virtual void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+
+ private:
+  std::string m_filename_mappings;
 };

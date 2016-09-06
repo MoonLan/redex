@@ -11,9 +11,25 @@
 
 #include "Pass.h"
 
-class InterDexPass : public Pass {
-  public:
-    InterDexPass() : Pass("InterDexPass") {}
+#define METRIC_COLD_START_SET_DEX_COUNT "cold_start_set_dex_count"
 
-    virtual void run_pass(DexClassesVector&, ConfigFiles&) override;
+#define INTERDEX_PASS_NAME "InterDexPass"
+
+class InterDexPass : public Pass {
+ public:
+  InterDexPass() : Pass(INTERDEX_PASS_NAME) {}
+
+  virtual void configure_pass(const PassConfig& pc) override {
+    pc.get("static_prune", false, m_static_prune);
+    pc.get("emit_canaries", true, m_emit_canaries);
+    pc.get("normal_primary_dex", false, m_normal_primary_dex);
+  }
+
+  virtual void run_pass(DexClassesVector&, ConfigFiles&, PassManager&);
+  virtual void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+
+ private:
+  bool m_static_prune;
+  bool m_emit_canaries;
+  bool m_normal_primary_dex;
 };

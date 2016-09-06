@@ -9,66 +9,45 @@
 
 #include "DexUtil.h"
 
-#include <mutex>
-#include <unordered_map>
-#include <regex.h>
 #include <unordered_set>
 
 #include "Debug.h"
 #include "DexClass.h"
 
-namespace {
-static std::mutex type_system_mutex;
-
-static std::unordered_map<const DexType*, DexClass*> type_to_class;
-static std::unordered_map<const DexType*, TypeVector> class_hierarchy;
-TypeVector empty_types;
-
-}
-
 DexType* get_object_type() {
-  static DexType* object = DexType::make_type("Ljava/lang/Object;");
-  return object;
+  return DexType::make_type("Ljava/lang/Object;");
 }
 
 DexType* get_void_type() {
-  static DexType* v = DexType::make_type("V");
-  return v;
+   return DexType::make_type("V");
 }
 
 DexType* get_int_type() {
-  static DexType* i = DexType::make_type("I");
-  return i;
+  return DexType::make_type("I");
 }
 
 DexType* get_long_type() {
-  static DexType* j = DexType::make_type("J");
-  return j;
+  return DexType::make_type("J");
 }
 
 DexType* get_boolean_type() {
-  static DexType* z = DexType::make_type("Z");
-  return z;
+  return DexType::make_type("Z");
 }
 
 DexType* get_double_type() {
-  static DexType* d = DexType::make_type("D");
-  return d;
+  return DexType::make_type("D");
 }
 
 DexType* get_string_type() {
-  static DexType* s = DexType::make_type("Ljava/lang/String;");
-  return s;
+  return DexType::make_type("Ljava/lang/String;");
 }
 
 DexType* get_class_type() {
-  static DexType* c = DexType::make_type("Ljava/lang/Class;");
-  return c;
+  return DexType::make_type("Ljava/lang/Class;");
 }
 
 DexType* get_enum_type() {
-  static DexType* en = DexType::make_type("Ljava/lang/Enum;");
-  return en;
+  return DexType::make_type("Ljava/lang/Enum;");
 }
 
 bool is_primitive(DexType* type) {
@@ -120,19 +99,6 @@ DataType type_to_datatype(const DexType* t) {
   not_reached();
 }
 
-void build_type_system(DexClass* cls) {
-  std::lock_guard<std::mutex> l(type_system_mutex);
-  const DexType* type = cls->get_type();
-  type_to_class.emplace(type, cls);
-  const auto& super = cls->get_super_class();
-  if (super) class_hierarchy[super].push_back(type);
-}
-
-DexClass* type_class(const DexType* t) {
-  auto it = type_to_class.find(t);
-  return it != type_to_class.end() ? it->second : nullptr;
-}
-
 char type_shorty(DexType* type) {
   auto const name = type->get_name()->c_str();
   switch (name[0]) {
@@ -175,11 +141,6 @@ bool has_hierarchy_in_scope(DexClass* cls) {
   return super == get_object_type();
 }
 
-const TypeVector& get_children(const DexType* type) {
-  const auto& it = class_hierarchy.find(type);
-  return it != class_hierarchy.end() ? it->second : empty_types;
-}
-
 void get_all_children(const DexType* type, TypeVector& children) {
   const auto& direct = get_children(type);
   for (const auto& child : direct) {
@@ -189,13 +150,11 @@ void get_all_children(const DexType* type, TypeVector& children) {
 }
 
 bool is_init(const DexMethod* method) {
-  static DexString* init = DexString::make_string("<init>");
-  return method->get_name() == init;
+  return strcmp(method->get_name()->c_str(), "<init>") == 0;
 }
 
 bool is_clinit(const DexMethod* method) {
-  static DexString* clinit = DexString::make_string("<clinit>");
-  return method->get_name() == clinit;
+  return strcmp(method->get_name()->c_str(), "<clinit>") == 0;
 }
 
 DexAccessFlags merge_visibility(uint32_t vis1, uint32_t vis2) {
@@ -229,13 +188,13 @@ DexType* get_array_type(const DexType* type) {
 }
 
 bool passes_args_through(DexOpcodeMethod* insn,
-                         DexCode* code,
+                         const DexCode& code,
                          int ignore /* = 0 */
                          ) {
-  auto regs = code->get_registers_size();
-  auto ins = code->get_ins_size();
+  auto regs = code.get_registers_size();
+  auto ins = code.get_ins_size();
   auto wc = insn->arg_word_count();
-  if (wc != (code->get_ins_size() - ignore)) return false;
+  if (wc != (code.get_ins_size() - ignore)) return false;
   for (int i = 0; i < wc; i++) {
     if (insn->src(i) != (regs - ins + i)) {
       return false;
@@ -244,99 +203,11 @@ bool passes_args_through(DexOpcodeMethod* insn,
   return true;
 }
 
-struct PenaltyPattern {
-  regex_t regex;
-  int penalty;
-  PenaltyPattern(const char* str, int pen) {
-    regcomp(&this->regex, str, 0);
-    this->penalty = pen;
-  }
-};
-
-std::vector<PenaltyPattern*>* compile_regexes() {
-  auto rv = new std::vector<PenaltyPattern*>;
-  rv->push_back(new PenaltyPattern("Layout;$", 1500));
-  rv->push_back(new PenaltyPattern("View;$", 1500));
-  rv->push_back(new PenaltyPattern("ViewGroup;$", 1800));
-  rv->push_back(new PenaltyPattern("Activity;$", 1500));
-  return rv;
+Scope build_class_scope(DexStoresVector& stores) {
+  return build_class_scope(DexStoreClassesIterator(stores));
 }
 
-const int kObjectVtable = 48;
-const int kMethodSize = 52;
-const int kInstanceFieldSize = 16;
-const int kVtableSlotSize = 4;
-
-inline bool matches_penalty(const char* string, int& penalty) {
-  static std::vector<PenaltyPattern*>* patterns = compile_regexes();
-  for (auto pattern : *patterns) {
-    if (regexec(&pattern->regex, string, 0, nullptr, 0) == 0) {
-      penalty = pattern->penalty;
-      return true;
-    }
-  }
-  return false;
-}
-
-int estimate_linear_alloc(DexClass* clazz) {
-  int lasize = 0;
-  /*
-   * VTable guestimate.  Technically we could do better here,
-   * but only so much.  Try to stay bug-compatible with
-   * DalvikStatsTool.
-   */
-  if (!(clazz->get_access() & DEX_ACCESS_INTERFACE)) {
-    int vtablePenalty = kObjectVtable;
-    if (!matches_penalty(clazz->get_type()->get_name()->c_str(), vtablePenalty)
-        && clazz->get_super_class() != nullptr) {
-      /* what?, we could be redexing object some day... :) */
-      matches_penalty(
-          clazz->get_super_class()->get_name()->c_str(), vtablePenalty);
-    }
-    lasize += vtablePenalty;
-    lasize += clazz->get_vmethods().size() * kVtableSlotSize;
-  }
-  /* Dmethods... */
-  lasize += clazz->get_dmethods().size() * kMethodSize;
-  /* Vmethods... */
-  lasize += clazz->get_vmethods().size() * kMethodSize;
-  /* Instance Fields */
-  lasize += clazz->get_ifields().size() * kInstanceFieldSize;
-  return lasize;
-}
-
-
-Scope build_class_scope(const DexClassesVector& dexen) {
-  Scope v;
-  for (auto const& classes : dexen) {
-    for (auto clazz : classes) {
-      v.push_back(clazz);
-    }
-  }
-  return v;
-}
-
-void post_dexen_changes(const Scope& v, DexClassesVector& dexen) {
-  std::unordered_set<DexClass*> clookup(v.begin(), v.end());
-  for (auto& classes : dexen) {
-    classes.erase(
-      std::remove_if(
-        classes.begin(),
-        classes.end(),
-        [&](DexClass* cls) {
-          return !clookup.count(cls);
-        }),
-      classes.end());
-  }
-  if (debug) {
-    std::unordered_set<DexClass*> dlookup;
-    for (auto const& classes : dexen) {
-      for (auto const& cls : classes) {
-        dlookup.insert(cls);
-      }
-    }
-    for (auto const& cls : clookup) {
-      assert_log(dlookup.count(cls), "Can't add classes in post_dexen_changes");
-    }
-  }
+void post_dexen_changes(const Scope& v, DexStoresVector& stores) {
+  DexStoreClassesIterator iter(stores);
+  post_dexen_changes(v, iter);
 }

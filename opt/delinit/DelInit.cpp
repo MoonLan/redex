@@ -16,9 +16,9 @@
 #include <unordered_set>
 #include <unordered_map>
 
-#include "walkers.h"
+#include "Walkers.h"
 #include "DexClass.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexUtil.h"
 #include "Resolver.h"
 #include "ReachableClasses.h"
@@ -31,11 +31,143 @@
 
 namespace {
 
+static std::unordered_set<const DexClass*> referenced_classes;
+// List of packages on the white list
+static std::vector<std::string> package_filter;
+
+// Note: this method will return nullptr if the dotname refers to an unknown
+// type.
+DexType* get_dextype_from_dotname(const char* dotname) {
+  if (dotname == nullptr) {
+    return nullptr;
+  }
+  std::string buf;
+  buf.reserve(strlen(dotname) + 2);
+  buf += 'L';
+  buf += dotname;
+  buf += ';';
+  std::replace(buf.begin(), buf.end(), '.', '/');
+  return DexType::get_type(buf.c_str());
+}
+
+// Search a class name in a list of package names, return true if there is a match
+bool find_package(const char* name) {
+  // If there's no whitelisted package, optimize every package by default
+  if (package_filter.size() == 0) {
+    return true;
+  }
+  for (auto& el_str : package_filter) {
+    auto const el_name = el_str.c_str();
+    if (strncmp(name, el_name, strlen(el_name)) == 0) {
+      return true;
+    }
+  }
+  return false;
+};
+
+void process_signature_anno(DexString* dstring) {
+  const char* cstr = dstring->c_str();
+  size_t len = strlen(cstr);
+  if (len < 3) return;
+  if (cstr[0] != 'L') return;
+  if (cstr[len - 1] == ';') {
+    auto dtype = DexType::get_type(dstring);
+    referenced_classes.insert(type_class(dtype));
+    return;
+  }
+  std::string buf(cstr);
+  buf += ';';
+  auto dtype = DexType::get_type(buf.c_str());
+  referenced_classes.insert(type_class(dtype));
+}
+
+void find_referenced_classes(const Scope& scope) {
+  std::unordered_set<DexString*> maybetypes;
+  walk_annotations(
+    scope,
+    [&](DexAnnotation* anno) {
+      static DexType* dalviksig =
+        DexType::get_type("Ldalvik/annotation/Signature;");
+      // Signature annotations contain strings that Jackson uses
+      // to construct the underlying types.
+      if (anno->type() == dalviksig) {
+        auto elems = anno->anno_elems();
+        for (auto const& elem : elems) {
+          auto ev = elem.encoded_value;
+          if (ev->evtype() != DEVT_ARRAY) continue;
+          auto arrayev = static_cast<DexEncodedValueArray*>(ev);
+          auto const& evs = arrayev->evalues();
+          for (auto strev : *evs) {
+            if (strev->evtype() != DEVT_STRING) continue;
+            auto stringev = static_cast<DexEncodedValueString*>(strev);
+            process_signature_anno(stringev->string());
+          }
+        }
+        return;
+      }
+      // Class literals in annotations.
+      // Example:
+      //    @JsonDeserialize(using=MyJsonDeserializer.class)
+      if (anno->runtime_visible()) {
+        auto elems = anno->anno_elems();
+        for (auto const& dae : elems) {
+          auto evalue = dae.encoded_value;
+          std::vector<DexType*> ltype;
+          evalue->gather_types(ltype);
+          if (ltype.size()) {
+            for (auto dextype : ltype) {
+              referenced_classes.insert(type_class(dextype));
+            }
+          }
+        }
+      }
+    });
+
+  walk_code(
+    scope,
+    [](DexMethod*) { return true; },
+    [&](DexMethod* meth, DexCode& code) {
+      auto opcodes = code.get_instructions();
+      for (const auto& opcode : opcodes) {
+        // Matches any stringref that name-aliases a type.
+        if (opcode->has_strings()) {
+          auto stringop = static_cast<DexOpcodeString*>(opcode);
+          DexString* dsclzref = stringop->get_string();
+          DexType* dtexclude =
+            get_dextype_from_dotname(dsclzref->c_str());
+          if (dtexclude == nullptr) continue;
+          TRACE(PGR, 3, "string_ref: %s\n", SHOW(dtexclude));
+          referenced_classes.insert(type_class(dtexclude));
+        }
+        if (opcode->has_types()) {
+          auto typeop = static_cast<DexOpcodeType*>(opcode);
+          TRACE(PGR, 3, "type_ref: %s\n", SHOW(typeop->get_type()));
+          referenced_classes.insert(type_class(typeop->get_type()));
+        }
+      }
+    });
+}
+
+bool can_remove(const DexClass* cls) {
+  return can_delete(cls) && !referenced_classes.count(cls);
+}
+
+bool can_remove(const DexMethod* m) {
+  return can_remove(type_class(m->get_class()));
+}
+
+bool can_remove(const DexField* f) {
+  return can_remove(type_class(f->get_class()));
+}
+
 /**
  * Return true for classes that should not be processed by the optimization.
  */
 bool filter_class(DexClass* clazz) {
   always_assert(!clazz->is_external());
+  if (!find_package(clazz->get_name()->c_str())) {
+    return true;
+  }
   return is_interface(clazz) || is_annotation(clazz) || !can_remove_class(clazz) ;
 }
 
@@ -118,7 +250,7 @@ int DeadRefs::find_new_unreachable(Scope& scope) {
       init_called++;
       continue;
     }
-    if (!can_delete(init)) {
+    if (!can_remove(init)) {
       init_cant_delete++;
       continue;
     }
@@ -177,12 +309,12 @@ void DeadRefs::find_unreachable_data(DexClass* clazz) {
   classes.insert(clazz);
 
   for (const auto& meth : clazz->get_vmethods()) {
-    if (!can_delete(meth)) continue;
+    if (!can_remove(meth)) continue;
     vmethods.insert(meth);
   }
 
   for (const auto& field : clazz->get_ifields()) {
-    if (!can_delete(field)) continue;
+    if (!can_remove(field)) continue;
     ifields.insert(field);
   }
 }
@@ -224,11 +356,11 @@ void DeadRefs::track_callers(Scope& scope) {
   called.clear();
   walk_opcodes(scope,
       [](DexMethod*) { return true; },
-      [&](DexMethod* m, DexOpcode* opcode) {
-        if (opcode->has_methods()) {
-          auto methodop = static_cast<DexOpcodeMethod*>(opcode);
+      [&](DexMethod* m, DexInstruction* insn) {
+        if (insn->has_methods()) {
+          auto methodop = static_cast<DexOpcodeMethod*>(insn);
           auto callee = methodop->get_method();
-          callee = resolve_method(callee, opcode_to_search(opcode));
+          callee = resolve_method(callee, opcode_to_search(insn));
           if (callee == nullptr || !callee->is_concrete()) return;
           if (vmethods.count(callee) > 0) {
             vmethods.erase(callee);
@@ -236,13 +368,13 @@ void DeadRefs::track_callers(Scope& scope) {
           called.insert(callee);
           return;
         }
-        if (opcode->has_fields()) {
-          auto fieldop = static_cast<DexOpcodeField*>(opcode);
+        if (insn->has_fields()) {
+          auto fieldop = static_cast<DexOpcodeField*>(insn);
           auto field = fieldop->field();
           field = resolve_field(field,
-              is_ifield_op(opcode->opcode()) ?
+              is_ifield_op(insn->opcode()) ?
                   FieldSearch::Instance :
-                  is_sfield_op(opcode->opcode()) ?
+                  is_sfield_op(insn->opcode()) ?
                       FieldSearch::Static : FieldSearch::Any);
           if (field == nullptr || !field->is_concrete()) return;
           if (ifields.count(field) > 0) {
@@ -303,7 +435,7 @@ int DeadRefs::remove_unreachable() {
       called_dmeths++;
       continue;
     }
-    if (!can_delete(meth)) {
+    if (!can_remove(meth)) {
       dont_delete_dmeths++;
       continue;
     }
@@ -324,8 +456,14 @@ int DeadRefs::remove_unreachable() {
 
 }
 
-void DelInitPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  auto scope = build_class_scope(dexen);
+void DelInitPass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  if (!cfg.using_seeds && m_package_filter.size() == 0) {
+    TRACE(DELINIT, 1, "No seeds information so not running DelInit\n");
+    return;
+  }
+  package_filter = m_package_filter;
+  auto scope = build_class_scope(stores);
+  find_referenced_classes(scope);
   DeadRefs drefs;
   drefs.delinit(scope);
   TRACE(DELINIT, 1, "Removed %d <init> methods\n",
@@ -336,5 +474,5 @@ void DelInitPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
       drefs.del_init_res.deleted_ifields);
   TRACE(DELINIT, 1, "Removed %d dmethods\n",
       drefs.del_init_res.deleted_dmeths);
-  post_dexen_changes(scope, dexen);
+  post_dexen_changes(scope, stores);
 }

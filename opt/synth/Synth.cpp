@@ -21,14 +21,15 @@
 #include "Debug.h"
 #include "DexClass.h"
 #include "DexLoader.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
+#include "Mutators.h"
 #include "Resolver.h"
 #include "PassManager.h"
 #include "Transform.h"
 #include "ReachableClasses.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 #include "SynthConfig.h"
 
@@ -50,7 +51,7 @@ bool can_remove(DexMethod* meth, const SynthConfig& synthConfig) {
  *   return-TYPE vA
  */
 DexField* trivial_get_field_wrapper(DexMethod* m) {
-  DexCode* code = m->get_code();
+  auto& code = m->get_code();
   if (code == nullptr) return nullptr;
 
   auto& insns = code->get_instructions();
@@ -85,7 +86,7 @@ DexField* trivial_get_field_wrapper(DexMethod* m) {
  *   return-TYPE vA
  */
 DexField* trivial_get_static_field_wrapper(DexMethod* m) {
-  DexCode* code = m->get_code();
+  auto& code = m->get_code();
   if (code == nullptr) return nullptr;
 
   auto& insns = code->get_instructions();
@@ -122,7 +123,7 @@ DexField* trivial_get_static_field_wrapper(DexMethod* m) {
  *    | return-void )
  */
 DexMethod* trivial_method_wrapper(DexMethod* m) {
-  DexCode* code = m->get_code();
+  auto& code = m->get_code();
   if (code == nullptr) return nullptr;
   auto& insns = code->get_instructions();
   auto it = insns.begin();
@@ -155,7 +156,7 @@ DexMethod* trivial_method_wrapper(DexMethod* m) {
           SHOW(collision));
     return nullptr;
   }
-  if (!passes_args_through(invoke, code)) return nullptr;
+  if (!passes_args_through(invoke, *code)) return nullptr;
   if (++it == insns.end()) return nullptr;
 
   if (is_move_result((*it)->opcode())) {
@@ -177,16 +178,16 @@ DexMethod* trivial_method_wrapper(DexMethod* m) {
  *   return-void
  */
 DexMethod* trivial_ctor_wrapper(DexMethod* m) {
-  DexCode* code = m->get_code();
+  auto& code = m->get_code();
   if (code == nullptr) return nullptr;
   auto& insns = code->get_instructions();
   auto it = insns.begin();
-  auto invoke = static_cast<DexOpcodeMethod*>(*it);
-  if (invoke->opcode() != OPCODE_INVOKE_DIRECT) {
+  if ((*it)->opcode() != OPCODE_INVOKE_DIRECT) {
     TRACE(SYNT, 5, "Rejecting, not direct: %s\n", SHOW(m));
     return nullptr;
   }
-  if (!passes_args_through(invoke, code, 1)) {
+  auto invoke = static_cast<DexOpcodeMethod*>(*it);
+  if (!passes_args_through(invoke, *code, 1)) {
     TRACE(SYNT, 5, "Rejecting, not passthrough: %s\n", SHOW(m));
     return nullptr;
   }
@@ -310,7 +311,7 @@ WrapperMethods analyze(const std::vector<DexClass*>& classes,
   return ssms;
 }
 
-DexOpcode* make_iget(DexField* field, uint8_t dest, uint8_t src) {
+DexInstruction* make_iget(DexField* field, uint8_t dest, uint8_t src) {
   auto const opcode = [&]() {
     switch (type_to_datatype(field->get_type())) {
     case DataType::Array:
@@ -340,7 +341,7 @@ DexOpcode* make_iget(DexField* field, uint8_t dest, uint8_t src) {
   return (new DexOpcodeField(opcode, field))->set_dest(dest)->set_src(0, src);
 }
 
-DexOpcode* make_sget(DexField* field, uint8_t dest) {
+DexInstruction* make_sget(DexField* field, uint8_t dest) {
   auto const opcode = [&]() {
     switch (type_to_datatype(field->get_type())) {
     case DataType::Array:
@@ -371,7 +372,7 @@ DexOpcode* make_sget(DexField* field, uint8_t dest) {
 
 bool replace_getter_wrapper(MethodTransformer& transform,
                             DexOpcodeMethod* meth_insn,
-                            DexOpcode* move_result,
+                            DexInstruction* move_result,
                             DexField* field) {
   TRACE(SYNT, 2, "Optimizing getter wrapper call: %s\n", SHOW(meth_insn));
   assert(field->is_concrete());
@@ -437,33 +438,21 @@ bool can_update_wrappee(DexMethod* wrappee, DexMethod* wrapper) {
   DexProto* new_proto = DexProto::make_proto(
     old_proto->get_rtype(),
     DexTypeList::make_type_list(std::move(new_args)));
-  if (find_collision_excepting(wrapper,
-                               wrappee->get_name(),
-                               new_proto,
-                               type_class(wrappee->get_class()),
-                               false /* is_virtual */,
-                               true /* check_direct */)) {
-    return false;
+  auto new_name = wrappee->get_name();
+  auto new_class = type_class(wrappee->get_class());
+  if (find_collision(new_name, new_proto, new_class, false)) {
+    if (find_collision_excepting(
+          wrapper,
+          new_name,
+          new_proto,
+          new_class,
+          false /* is_virtual */,
+          true /* check_direct */)) {
+      return false;
+    }
+    return can_delete(wrapper);
   }
   return true;
-}
-
-/**
- * If the wrappee wasn't initially static we need to make `this` an explicit
- * parameter.
- */
-void make_static_and_update_args(DexMethod* wrappee, DexMethod* wrapper) {
-  assert(can_update_wrappee(wrappee, wrapper));
-  DexProto* old_proto = wrappee->get_proto();
-  std::list<DexType*> new_args = old_proto->get_args()->get_type_list();
-  new_args.push_front(wrappee->get_class());
-  DexProto* new_proto = DexProto::make_proto(
-    old_proto->get_rtype(),
-    DexTypeList::make_type_list(std::move(new_args)));
-  wrappee->change_proto(new_proto);
-  auto& dmethods = type_class(wrappee->get_class())->get_dmethods();
-  dmethods.sort(compare_dexmethods);
-  wrappee->set_access(wrappee->get_access() | ACC_STATIC);
 }
 
 bool replace_method_wrapper(MethodTransformer& transform,
@@ -478,7 +467,8 @@ bool replace_method_wrapper(MethodTransformer& transform,
   assert(wrappee->is_concrete() && wrapper->is_concrete());
 
   if (is_static(wrapper) && !is_static(wrappee)) {
-    make_static_and_update_args(wrappee, wrapper);
+    assert(can_update_wrappee(wrappee, wrapper));
+    mutators::make_static(wrappee);
     ssms.promoted_to_static.insert(wrappee);
   }
   if (!is_private(wrapper)) {
@@ -522,14 +512,15 @@ void replace_ctor_wrapper(MethodTransformer& transform,
 }
 
 void replace_wrappers(DexMethod* caller_method,
-                      DexCode* code,
+                      DexCode& code,
                       WrapperMethods& ssms) {
-  std::vector<std::tuple<DexOpcodeMethod*, DexOpcode*, DexField*>> getter_calls;
+  std::vector<std::tuple<DexOpcodeMethod*, DexInstruction*, DexField*>> getter_calls;
   std::vector<std::pair<DexOpcodeMethod*, DexMethod*>> wrapper_calls;
   std::vector<std::pair<DexOpcodeMethod*, DexMethod*>> wrapped_calls;
   std::vector<std::pair<DexOpcodeMethod*, DexMethod*>> ctor_calls;
 
-  auto& insns = code->get_instructions();
+  TRACE(SYNT, 4, "Replacing wrappers in %s\n", SHOW(caller_method));
+  auto& insns = code.get_instructions();
   for (auto it = insns.begin(); it != insns.end(); ++it) {
     auto insn = *it;
     if (insn->opcode() == OPCODE_INVOKE_STATIC) {
@@ -557,7 +548,10 @@ void replace_wrappers(DexMethod* caller_method,
         wrapper_calls.emplace_back(meth_insn, method);
         continue;
       }
-      assert(ssms.wrapped.find(callee) == ssms.wrapped.end());
+      always_assert_log(
+        ssms.wrapped.find(callee) == ssms.wrapped.end(),
+        "caller: %s\ncallee: %s\ninsn: %s\n",
+        SHOW(caller_method), SHOW(callee), SHOW(insn));
 
       ssms.keepers.emplace(callee);
     } else if (insn->opcode() == OPCODE_INVOKE_DIRECT ||
@@ -712,7 +706,7 @@ void remove_dead_methods(WrapperMethods& ssms, const SynthConfig& synthConfig) {
       TRACE(SYNT, 2, "Retaining method: %s\n", SHOW(meth));
       return;
     }
-    if (do_not_strip(meth)) {
+    if (!can_delete(meth)) {
       TRACE(SYNT, 2, "Do not strip: %s\n", SHOW(meth));
       return;
     }
@@ -775,16 +769,28 @@ void remove_dead_methods(WrapperMethods& ssms, const SynthConfig& synthConfig) {
 
 void transform(const std::vector<DexClass*>& classes,
                WrapperMethods& ssms, const SynthConfig& synthConfig) {
-  // remove wrappers
-  walk_code(
-      classes,
-      [](DexMethod*) { return true; },
-      [&](DexMethod* m, DexCode* code) { replace_wrappers(m, code, ssms); });
+  // remove wrappers.  build a vector ahead of time to ensure we only visit each
+  // method once, even if we mutate the class method lists such that we'd hit
+  // something a second time.
+  std::vector<DexMethod*> methods;
+  for (auto const& cls : classes) {
+    for (auto const& dm : cls->get_dmethods()) {
+      methods.emplace_back(dm);
+    }
+    for (auto const& vm : cls->get_vmethods()) {
+      methods.emplace_back(vm);
+    }
+  }
+  for (auto const& m : methods) {
+    if (m->get_code()) {
+      replace_wrappers(m, *m->get_code(), ssms);
+    }
+  }
   // check that invokes to promoted static method is correct
   walk_opcodes(
       classes,
       [](DexMethod*) { return true; },
-      [&](DexMethod* meth, DexOpcode* insn) {
+      [&](DexMethod* meth, DexInstruction* insn) {
         auto opcode = insn->opcode();
         if (opcode != OPCODE_INVOKE_DIRECT &&
             opcode != OPCODE_INVOKE_DIRECT_RANGE) {
@@ -846,35 +852,12 @@ bool optimize(const std::vector<DexClass*>& classes,
   return ssms.next_pass;
 }
 
-const int64_t MAX_PASSES = 5;
-SynthConfig load_config(const folly::dynamic& config) {
-  auto get_value = [&](const char* value, int64_t default_val) {
-    if (config.isObject()) {
-      auto it = config.find(value);
-      if (it != config.items().end()) {
-        TRACE(SYNT, 2, "Setting config %s to %ld\n", value,
-              it->second.asInt());
-        return it->second.asInt();
-      }
-    }
-    TRACE(SYNT, 2, "For %s using default value %ld\n", value, default_val);
-    return default_val;
-  };
-
-  int64_t max_passes = get_value("max_passes", MAX_PASSES);
-  int64_t synth_only = get_value("synth_only", 0);
-  int64_t remove_pub = get_value("remove_pub", 1);
-  SynthConfig synthConfig = {max_passes, (bool)synth_only, (bool)remove_pub};
-  return synthConfig;
-}
-
-void SynthPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  SynthConfig synthConfig = load_config(m_config);
-  Scope scope = build_class_scope(dexen);
+void SynthPass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  Scope scope = build_class_scope(stores);
   int passes = 0;
   do {
     TRACE(SYNT, 1, "Synth removal, pass %d\n", passes);
-    bool more_opt_needed = optimize(scope, synthConfig);
+    bool more_opt_needed = optimize(scope, m_pass_config);
     if (!more_opt_needed) break;
-  } while (++passes < synthConfig.max_passes);
+  } while (++passes < m_pass_config.max_passes);
 }

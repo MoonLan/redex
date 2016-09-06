@@ -23,62 +23,9 @@
 #include "ReachableClasses.h"
 #include "Resolver.h"
 #include "Transform.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 static size_t unhandled_inline = 0;
-
-/*
- * Format: array of "Lpkg/Class;"
- */
-std::unordered_set<DexType*> keep_class_member_annos(
-    const folly::dynamic& config, ConfigFiles& cfg) {
-  std::unordered_set<DexType*> keep;
-  for (const auto& anno : cfg.get_no_optimizations_annos()) {
-    keep.emplace(anno);
-  }
-  try {
-    for (auto const& keep_anno : config["keep_class_member_annos"]) {
-      auto type = DexType::get_type(DexString::get_string(keep_anno.c_str()));
-      if (type != nullptr) {
-        keep.emplace(type);
-      }
-    }
-  } catch (...) {
-    // Swallow exception if the field isn't there.
-  }
-  return keep;
-}
-
-/*
- * Format: array of "Type Lpkg/Class;.fieldName"
- */
-std::unordered_set<DexField*> keep_class_members(const folly::dynamic& config) {
-  std::unordered_set<DexField*> keep;
-  try {
-    for (auto const& keep_thing : config["keep_class_members"]) {
-      auto keepstr = keep_thing.asString();
-      auto tpos = keepstr.find(' ');
-      auto cpos = keepstr.find('.');
-      auto type = DexType::get_type(keepstr.substr(0, tpos).c_str());
-      auto cls =
-        DexType::get_type(keepstr.substr(tpos + 1, cpos - tpos - 1).c_str());
-      auto name = DexString::get_string(keepstr.substr(cpos + 1).c_str());
-      if (!type || !cls || !name) {
-        fprintf(stderr,
-                "Unknown field %s in keep_class_members\n",
-                keepstr.c_str());
-        continue;
-      }
-      auto field = DexField::get_field(cls, name, type);
-      if (field != nullptr) {
-        keep.emplace(field);
-      }
-    }
-  } catch (...) {
-    // Swallow exception if the field isn't there.
-  }
-  return keep;
-}
 
 std::unordered_set<DexField*> get_called_field_defs(Scope& scope) {
   std::vector<DexField*> field_refs;
@@ -109,43 +56,32 @@ std::unordered_set<DexField*> get_field_target(
   return ftarget;
 }
 
-bool is_kept_by_annotation(const DexField* sfield,
-                           const std::unordered_set<DexType*>& keep_annos) {
-  auto annoset = sfield->get_anno_set();
-  if (!annoset) {
-    return false;
-  }
-  auto const& annos = annoset->get_annotations();
-  for (auto& anno : annos) {
-    if (keep_annos.count(anno->type())) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool is_kept_member(DexField* sfield,
-                    const std::unordered_set<DexField*>& keep_members) {
-  return keep_members.count(sfield);
-}
-
 void remove_unused_fields(Scope& scope,
-                          const std::unordered_set<DexType*>& keep_annos,
-                          const std::unordered_set<DexField*>& keep_members) {
+    const std::vector<std::string>& remove_members) {
   std::vector<DexField*> moveable_fields;
   std::vector<DexClass*> smallscope;
   uint32_t aflags = ACC_STATIC | ACC_FINAL;
   for (auto clazz : scope) {
-    if (!can_delete(clazz)) {
-      continue;
+    bool found = can_delete(clazz);
+    if (!found) {
+      auto name = clazz->get_name()->c_str();
+      for (const auto& name_prefix : remove_members) {
+        if (strstr(name, name_prefix.c_str()) != nullptr) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        TRACE(FINALINLINE, 2, "Cannot delete: %s\n", SHOW(clazz));
+        continue;
+      }
     }
     auto sfields = clazz->get_sfields();
     for (auto sfield : sfields) {
       if ((sfield->get_access() & aflags) != aflags) continue;
       auto value = sfield->get_static_value();
       if (value == nullptr && !is_primitive(sfield->get_type())) continue;
-      if (is_kept_by_annotation(sfield, keep_annos)) continue;
-      if (is_kept_member(sfield, keep_members)) continue;
+      if (!found && !can_delete(sfield)) continue;
 
       moveable_fields.push_back(sfield);
       smallscope.push_back(clazz);
@@ -207,7 +143,7 @@ static bool validate_sget(DexMethod* context, DexOpcodeField* opfield) {
   return false;
 }
 
-void replace_opcode(DexMethod* method, DexOpcode* from, DexOpcode* to) {
+void replace_opcode(DexMethod* method, DexInstruction* from, DexInstruction* to) {
   MethodTransform* mt = MethodTransform::get_method_transform(method);
   mt->replace_opcode(from, to);
 }
@@ -231,7 +167,7 @@ void inline_cheap_sget(DexMethod* method, DexOpcodeField* opfield) {
                       " CONST_16 or CONST_HIGH16, bailing\n");
   }();
 
-  auto newopcode = (new DexOpcode(opcode, 0))->set_dest(dest)->set_literal(v);
+  auto newopcode = (new DexInstruction(opcode, 0))->set_dest(dest)->set_literal(v);
   replace_opcode(method, opfield, newopcode);
 }
 
@@ -245,7 +181,7 @@ void inline_sget(DexMethod* method, DexOpcodeField* opfield) {
   /* FIXME for sget_wide case */
   uint32_t v = value != nullptr ? (uint32_t)value->value() : 0;
 
-  auto newopcode = (new DexOpcode(opcode))->set_dest(dest)->set_literal(v);
+  auto newopcode = (new DexInstruction(opcode))->set_dest(dest)->set_literal(v);
   replace_opcode(method, opfield, newopcode);
 }
 
@@ -262,7 +198,7 @@ void get_sput_in_clinit(DexClass* clazz,
     if (is_clinit(method)) {
       always_assert_log(is_static(method) && is_constructor(method),
           "static constructor doesn't have the proper access bits set\n");
-      auto code = method->get_code();
+      auto& code = method->get_code();
       auto opcodes = code->get_instructions();
       for (auto opcode : opcodes) {
         if (opcode->has_fields() && is_sput(opcode->opcode())) {
@@ -282,6 +218,7 @@ void inline_field_values(Scope& fullscope) {
   std::unordered_set<DexField*> cheap_inline_field;
   std::vector<DexClass*> scope;
   uint32_t aflags = ACC_STATIC | ACC_FINAL;
+
   for (auto clazz : fullscope) {
     std::unordered_map<DexField*, bool> blank_statics;
     get_sput_in_clinit(clazz, blank_statics);
@@ -309,9 +246,9 @@ void inline_field_values(Scope& fullscope) {
   walk_opcodes(
       fullscope,
       [](DexMethod* method) { return true; },
-      [&](DexMethod* method, DexOpcode* opcode) {
-        if (opcode->has_fields() && is_sfield_op(opcode->opcode())) {
-          auto fieldop = static_cast<DexOpcodeField*>(opcode);
+      [&](DexMethod* method, DexInstruction* insn) {
+        if (insn->has_fields() && is_sfield_op(insn->opcode())) {
+          auto fieldop = static_cast<DexOpcodeField*>(insn);
           auto field = resolve_field(fieldop->field(), FieldSearch::Static);
           if (field == nullptr || !field->is_concrete()) return;
           if (inline_field.count(field) == 0) return;
@@ -335,10 +272,8 @@ void inline_field_values(Scope& fullscope) {
   MethodTransform::sync_all();
 }
 
-void FinalInlinePass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  auto keep_annos = keep_class_member_annos(m_config, cfg);
-  auto keep_members = keep_class_members(m_config);
-  auto scope = build_class_scope(dexen);
+void FinalInlinePass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  auto scope = build_class_scope(stores);
   inline_field_values(scope);
-  remove_unused_fields(scope, keep_annos, keep_members);
+  remove_unused_fields(scope, m_remove_class_members);
 }

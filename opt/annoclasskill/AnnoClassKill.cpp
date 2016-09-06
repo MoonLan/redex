@@ -19,7 +19,7 @@
 #include "DexLoader.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 typedef std::unordered_set<DexClass*> class_set_t;
 
@@ -99,8 +99,8 @@ void kill_annotation_classes(
   walk_code(
     scope,
     [](DexMethod*) { return true; },
-    [&](DexMethod* meth, DexCode* code) {
-      auto opcodes = code->get_instructions();
+    [&](DexMethod* meth, DexCode& code) {
+      auto opcodes = code.get_instructions();
       for (const auto& opcode : opcodes) {
         if (opcode->has_types()) {
           auto typeop = static_cast<DexOpcodeType*>(opcode);
@@ -134,10 +134,12 @@ void kill_annotation_classes(
           annotations_removed_count);
 }
 
-std::unordered_set<DexType*> get_kill_annos(const folly::dynamic& config) {
+std::unordered_set<DexType*> get_kill_annos(
+  const std::vector<std::string>& kill
+) {
   std::unordered_set<DexType*> kill_annos;
   try {
-    for (auto const& config_anno : config["kill_annos"]) {
+    for (auto const& config_anno : kill) {
       DexType* anno = DexType::get_type(config_anno.c_str());
       if (anno) {
         TRACE(CLASSKILL, 2, "kill anno: %s\n", SHOW(anno));
@@ -150,9 +152,9 @@ std::unordered_set<DexType*> get_kill_annos(const folly::dynamic& config) {
   return kill_annos;
 }
 
-void AnnoClassKillPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  auto scope = build_class_scope(dexen);
-  auto kill_annos = get_kill_annos(m_config);
+void AnnoClassKillPass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  auto scope = build_class_scope(stores);
+  auto kill_annos = get_kill_annos(m_kill_annos);
   kill_annotation_classes(scope, kill_annos);
-  post_dexen_changes(scope, dexen);
+  post_dexen_changes(scope, stores);
 }

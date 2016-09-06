@@ -16,18 +16,18 @@
 #include "Debug.h"
 #include "DexClass.h"
 
-ConfigFiles::ConfigFiles(const folly::dynamic& config) :
+ConfigFiles::ConfigFiles(const Json::Value& config) :
     m_proguard_map(
-        config.getDefault("proguard_map", "").asString().toStdString()),
+      config.get("proguard_map", "").asString()),
     m_coldstart_class_filename(
-        config.getDefault("coldstart_classes", "").asString().toStdString()),
+      config.get("coldstart_classes", "").asString()),
     m_coldstart_method_filename(
-        config.getDefault("coldstart_methods", "").asString().toStdString())
+      config.get("coldstart_methods", "").asString())
 {
-  auto no_optimizations_anno = config.find("no_optimizations_annotations");
-  if (no_optimizations_anno != config.items().end()) {
-    for (auto const& config_anno_name : no_optimizations_anno->second) {
-      std::string anno_name = toStdString(config_anno_name.asString());
+  auto no_optimizations_anno = config["no_optimizations_annotations"];
+  if (no_optimizations_anno != Json::nullValue) {
+    for (auto const& config_anno_name : no_optimizations_anno) {
+      std::string anno_name = config_anno_name.asString();
       DexType* anno = DexType::get_type(anno_name.c_str());
       if (anno) m_no_optimizations_annos.insert(anno);
     }
@@ -40,18 +40,18 @@ ConfigFiles::ConfigFiles(const folly::dynamic& config) :
  */
 std::vector<std::string> ConfigFiles::load_coldstart_classes() {
   const char* kClassTail = ".class";
-  const int lentail = strlen(kClassTail);
+  const size_t lentail = strlen(kClassTail);
   auto file = m_coldstart_class_filename.c_str();
-  
+
   std::vector<std::string> coldstart_classes;
-  
+
   std::ifstream input(file);
   if (!input){
     return std::vector<std::string>();
   }
   std::string clzname;
   while (input >> clzname) {
-    int position = clzname.length() - lentail;
+		long position = clzname.length() - lentail;
     always_assert_log(position >= 0,
                       "Bailing, invalid class spec '%s' in interdex file %s\n",
                       clzname.c_str(), file);

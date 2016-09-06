@@ -17,14 +17,15 @@ extern "C" int yyparse();
 extern "C" FILE *yyin;
 extern "C" int line_number;
 
-#define WARN(x) printf("WARNING: %s\n", x)
+// #define WARN(x) printf("WARNING: %s\n", x)
+#define WARN(x) 
 #define ASSERT(x, y) if (!(x)) { printf("ERROR: %s", y); exit(-1);}
 
 void yyerror(const char* msg);
 
 /* TODO: consider conversion to using %parse-param to specify args for yyparse() */
 std::vector<KeepRule>* rules = nullptr;
-std::vector<std::string>* library_jars = nullptr;
+std::set<std::string>* library_jars = nullptr;
 
 // Used for both classes and members
 uint32_t flags;
@@ -107,6 +108,7 @@ static char* duplicate(char* original) {
 %token T_COMMA
 %token T_NOT
 %token T_AT
+%token T_QUOTE
 
 %token T_COMMENT
 
@@ -129,6 +131,7 @@ static char* duplicate(char* original) {
 %token T_APPLYMAPPING
 %token T_ASSUMENOSIDEEFFECTS
 %token T_CLASSOBFUSCATIONDICTIONARY
+%token T_DONTNOTE
 %token T_DONTOBFUSCATE
 %token T_DONTOPTIMIZE
 %token T_DONTPREVERIFY
@@ -138,6 +141,7 @@ static char* duplicate(char* original) {
 %token T_DONTSKIPNONPUBLICLIBRARYCLASSES
 %token T_FLATTENPACKAGEHIERARCHY
 %token T_INJARS
+%token T_INCLUDE
 %token T_KEEPATTRIBUTES
 %token T_KEEPPACKAGENAMES
 %token T_KEEPPARAMETERNAMES
@@ -192,7 +196,7 @@ RULE:
 DIRECTIVE:
     T_INJARS T_PATTERN |
     T_OUTJARS T_PATTERN |
-    T_LIBRARYJARS T_PATTERN { library_jars->push_back(duplicate(yylval)); }
+    T_LIBRARYJARS T_PATTERN { library_jars->emplace(duplicate(yylval)); }
     ;
 
 KEEP_RULE:
@@ -315,6 +319,7 @@ UNSUPPORTED_PROGUARD_RULE:
     T_APPLYMAPPING T_PATTERN |
     T_ASSUMENOSIDEEFFECTS CLASS_FILTER CLASS_MEMBERS |
     T_CLASSOBFUSCATIONDICTIONARY T_PATTERN |
+    T_DONTNOTE PATTERN_LIST |
     T_DONTOBFUSCATE |
     T_DONTOPTIMIZE |
     T_DONTPREVERIFY |
@@ -323,6 +328,7 @@ UNSUPPORTED_PROGUARD_RULE:
     T_DONTUSEMIXEDCASECLASSNAMES |
     T_DONTSKIPNONPUBLICLIBRARYCLASSES |
     T_FLATTENPACKAGEHIERARCHY T_PATTERN |
+    T_INCLUDE T_PATTERN |
     T_KEEPATTRIBUTES PATTERN_LIST |
     T_KEEPPACKAGENAMES PATTERN_LIST |
     T_KEEPPARAMETERNAMES |
@@ -338,6 +344,8 @@ UNSUPPORTED_PROGUARD_RULE:
     T_PRINTUSAGE T_PATTERN |
     T_RENAMESOURCEFILEATTRIBUTE T_PATTERN |
     T_REPACKAGECLASSES T_PATTERN |
+    T_REPACKAGECLASSES T_QUOTE T_PATTERN T_QUOTE |
+    T_REPACKAGECLASSES T_QUOTE T_QUOTE |
     T_USEUNIQUECLASSMEMBERNAMES |
     T_VERBOSE |
     T_WHYAREYOUKEEPING T_PATTERN;
@@ -357,7 +365,7 @@ PATTERN_LIST:
 %%
 
 bool parse_proguard_file(const char * file, std::vector<KeepRule>* passed_rules,
-                         std::vector<std::string>* passed_library_jars) {
+                         std::set<std::string>* passed_library_jars) {
     FILE *pgfile = fopen(file, "r");
     if (!pgfile) {
         std::cerr << "Couldn't open " << file << std::endl;

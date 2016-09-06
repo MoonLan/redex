@@ -9,19 +9,40 @@
 
 #pragma once
 
+#include "InlineHelper.h"
 #include "Pass.h"
 #include "DexClass.h"
 #include "Resolver.h"
 #include "Transform.h"
 
-#include <unordered_map>
-#include <unordered_set>
+#include <map>
+#include <set>
 
 class SimpleInlinePass : public Pass {
 public:
-  SimpleInlinePass() : Pass("SimpleInlinePass"), virtual_inline(true) {}
+  SimpleInlinePass() : Pass("SimpleInlinePass") {}
 
-  virtual void run_pass(DexClassesVector&, ConfigFiles&) override;
+  virtual void configure_pass(const PassConfig& pc) override {
+    pc.get("virtual", true, m_virtual_inline);
+    pc.get("try_catch", false, m_inliner_config.try_catch_inline);
+    pc.get("callee_invoke_direct",
+           false,
+           m_inliner_config.callee_direct_invoke_inline);
+    pc.get("virtual_same_class",
+           false,
+           m_inliner_config.virtual_same_class_inline);
+    pc.get("super_same_class", false, m_inliner_config.super_same_class_inline);
+    pc.get("use_liveness", false, m_inliner_config.use_liveness);
+    pc.get("no_inline_annos", {}, m_no_inline_annos);
+
+    std::vector<std::string> black_list;
+    pc.get("black_list", {}, black_list);
+    for (const auto& type_s : black_list) {
+      m_inliner_config.black_list.emplace(DexType::make_type(type_s.c_str()));
+    }
+  }
+
+  virtual void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
 private:
   std::unordered_set<DexMethod*> gather_non_virtual_methods(
@@ -34,7 +55,12 @@ private:
   static const size_t SMALL_CODE_SIZE = 3;
 
   // inline virtual methods
-  bool virtual_inline;
+  bool m_virtual_inline;
+
+  MultiMethodInliner::Config m_inliner_config;
+
+  // annotations indicating not to inline a function
+  std::vector<std::string> m_no_inline_annos;
 
   // set of inlinable methods
   std::unordered_set<DexMethod*> inlinable;

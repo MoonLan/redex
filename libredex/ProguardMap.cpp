@@ -18,7 +18,16 @@ namespace {
 
 constexpr size_t kBufSize = 4096;
 
-std::string convert_scalar_type(const char* type) {
+std::string find_or_same(
+  const std::string& key,
+  const std::map<std::string, std::string>& map
+) {
+  auto it = map.find(key);
+  if (it == map.end()) return key;
+  return it->second;
+}
+
+std::string convert_scalar_type(std::string type) {
   static const std::map<std::string, std::string> prim_map =
     {{"void",    "V"},
      {"boolean", "Z"},
@@ -38,49 +47,25 @@ std::string convert_scalar_type(const char* type) {
   return std::string("L") + ret + ";";
 }
 
-std::string convert_type(const char* type) {
-  if (type[strlen(type) - 1] == ']') {
-    std::string elem_type(type, strrchr(type, '[') - type);
-    return std::string("[") + convert_type(elem_type.c_str());
-  }
-  return convert_scalar_type(type);
+std::string convert_field(std::string cls, std::string type, std::string name) {
+  return cls + "." + name + ":" + type;
 }
 
-std::string convert_args(const char* args) {
-  const char* p = args;
-  std::string ret;
-  while (*p != '\0') {
-    const char* n = strchr(p, ',');
-    if (n) {
-      std::string arg(p, n - p);
-      ret += convert_type(arg.c_str());
-      p = n + 1;
-    } else {
-      ret += convert_type(p);
-      break;
-    }
-  }
-  return ret;
+std::string convert_method(
+  std::string cls,
+  std::string rtype,
+  std::string methodname,
+  std::string args
+) {
+  return cls + "." + methodname + "(" + args + ")" + rtype;
 }
 
-std::string convert_proguard_field(
-  const std::string& cls,
-  const char* type,
-  const char* name) {
-  return cls + "." + name + ":" + convert_type(type);
+std::string translate_type(std::string type, const ProguardMap& pm) {
+  auto base_start = type.find_first_not_of("[");
+  auto array_prefix = type.substr(0, base_start);
+  auto base_type = type.substr(base_start);
+  return array_prefix + pm.translate_class(base_type);
 }
-
-std::string convert_proguard_method(
-  const std::string& cls,
-  const char* rtype,
-  const char* methodname,
-  const char* args) {
-  return cls + "." +
-    std::string(methodname) +
-    "(" + convert_args(args) + ")" +
-    convert_type(rtype);
-}
-
 }
 
 ProguardMap::ProguardMap(const std::string& filename) {
@@ -91,33 +76,64 @@ ProguardMap::ProguardMap(const std::string& filename) {
   }
 }
 
-const std::string& ProguardMap::translate_class(const std::string& cls) {
-  auto it = m_classMap.find(cls);
-  if (it == m_classMap.end()) return cls;
-  return it->second;
+std::string ProguardMap::translate_class(const std::string& cls) const {
+  return find_or_same(cls, m_classMap);
 }
 
-const std::string& ProguardMap::translate_field(const std::string& field) {
-  return m_fieldMap[field];
+std::string ProguardMap::translate_field(const std::string& field) const {
+  return find_or_same(field, m_fieldMap);
 }
 
-const std::string& ProguardMap::translate_method(const std::string& method) {
-  return m_methodMap[method];
+std::string ProguardMap::translate_method(const std::string& method) const {
+  return find_or_same(method, m_methodMap);
 }
 
-void ProguardMap::parse_line(const std::string& line) {
-  if (parse_class(line)) {
-    return;
+std::string ProguardMap::deobfuscate_class(const std::string& cls) const {
+  return find_or_same(cls, m_obfClassMap);
+}
+
+std::string ProguardMap::deobfuscate_field(const std::string& field) const {
+  return find_or_same(field, m_obfFieldMap);
+}
+
+std::string ProguardMap::deobfuscate_method(const std::string& method) const {
+  return find_or_same(method, m_obfMethodMap);
+}
+
+std::string ProguardMap::deobfuscate_class_dynamic(const std::string& cls) const {
+  return find_or_same(cls, m_dynObfClassMap);
+}
+
+std::string ProguardMap::deobfuscate_method_dynamic(const std::string& method) const {
+  return find_or_same(method, m_dynObfMethodMap);
+}
+
+std::string ProguardMap::deobfuscate_field_dynamic(const std::string& field) const {
+  return find_or_same(field, m_dynObfFieldMap);
+}
+
+void ProguardMap::parse_proguard_map(std::istream& fp) {
+  std::string line;
+  while (std::getline(fp, line)) {
+    parse_class(line);
   }
-  if (parse_field(line)) {
-    return;
+  fp.clear();
+  fp.seekg(0);
+  assert_log(!fp.fail(), "Can't use ProguardMap with non-seekable stream");
+  while (std::getline(fp, line)) {
+    if (parse_class(line)) {
+      continue;
+    }
+    if (parse_field(line)) {
+      continue;
+    }
+    if (parse_method(line)) {
+      continue;
+    }
+    always_assert_log(false,
+                      "Bogus line encountered in proguard map: %s\n",
+                      line.c_str());
   }
-  if (parse_method(line)) {
-    return;
-  }
-  always_assert_log(false,
-                    "Bogus line encountered in proguard map: %s\n",
-                    line.c_str());
 }
 
 bool ProguardMap::parse_class(const std::string& line) {
@@ -131,6 +147,9 @@ bool ProguardMap::parse_class(const std::string& line) {
   m_currClass = convert_type(classname);
   m_currNewClass = convert_type(newname);
   m_classMap[m_currClass] = m_currNewClass;
+  m_obfClassMap[m_currNewClass] = m_currClass;
+  // initialize the dynamic map with the PG mapping
+  m_dynObfClassMap[m_currNewClass] = m_currClass;
   return true;
 }
 
@@ -143,9 +162,14 @@ bool ProguardMap::parse_field(const std::string& line) {
   if (n != 3) {
     return false;
   }
-  auto pgnew = convert_proguard_field(m_currNewClass, type, newname);
-  auto pgold = convert_proguard_field(m_currClass, type, fieldname);
+  auto ctype = convert_type(type);
+  auto xtype = translate_type(ctype, *this);
+  auto pgnew = convert_field(m_currNewClass, xtype.c_str(), newname);
+  auto pgold = convert_field(m_currClass, ctype.c_str(), fieldname);
   m_fieldMap[pgold] = pgnew;
+  m_obfFieldMap[pgnew] = pgold;
+  // initialize the dynamic map with the PG mapping
+  m_dynObfFieldMap[pgnew] = pgold;
   return true;
 }
 
@@ -205,11 +229,113 @@ bool ProguardMap::parse_method(const std::string& line) {
 }
 
 void ProguardMap::add_method_mapping(
-  const char* type,
+  const char* rtype,
   const char* methodname,
   const char* newname,
-  const char* args) {
-  auto pgold = convert_proguard_method(m_currClass, type, methodname, args);
-  auto pgnew = convert_proguard_method(m_currNewClass, type, newname, args);
+  const char* args
+) {
+  std::string old_args;
+  std::string new_args;
+  std::stringstream ss(args);
+  std::string arg;
+  while (std::getline(ss, arg, ',')) {
+    auto old_arg = convert_type(arg.c_str());
+    auto new_arg = translate_type(old_arg, *this);
+    old_args += old_arg;
+    new_args += new_arg;
+  }
+  auto old_rtype = convert_type(rtype);
+  auto new_rtype = translate_type(old_rtype, *this);
+  auto pgold = convert_method(m_currClass, old_rtype, methodname, old_args);
+  auto pgnew = convert_method(m_currNewClass, new_rtype, newname, new_args);
   m_methodMap[pgold] = pgnew;
+  m_obfMethodMap[pgnew] = pgold;
+  // initialize the dynamic map with the PG mapping
+  m_dynObfMethodMap[pgnew] = pgold;
+}
+
+void ProguardMap::update_class_mapping(const std::string& oldname, const std::string& newname) {
+  auto unobf_clsname = find_or_same(oldname, m_dynObfClassMap);
+  m_dynObfClassMap[newname] = unobf_clsname;
+}
+
+void apply_deobfuscated_names(
+  const std::vector<DexClasses>& dexen,
+  const ProguardMap& pm
+) {
+  for (auto const& dex : dexen) {
+    for (auto const& cls : dex) {
+      TRACE(PGR, 4, "deob cls %s %s\n",
+            proguard_name(cls).c_str(),
+            pm.deobfuscate_class(proguard_name(cls)).c_str());
+      cls->set_deobfuscated_name(pm.deobfuscate_class(proguard_name(cls)));
+      for (auto const& m : cls->get_dmethods()) {
+        TRACE(PGR, 4, "deob dmeth %s %s\n",
+              proguard_name(m).c_str(),
+              pm.deobfuscate_method(proguard_name(m)).c_str());
+        m->set_deobfuscated_name(pm.deobfuscate_method(proguard_name(m)));
+      }
+      for (auto const& m : cls->get_vmethods()) {
+        TRACE(PM, 4, "deob vmeth %s %s\n",
+              proguard_name(m).c_str(),
+              pm.deobfuscate_method(proguard_name(m)).c_str());
+        m->set_deobfuscated_name(pm.deobfuscate_method(proguard_name(m)));
+      }
+
+      for (auto const& f : cls->get_ifields()) {
+        TRACE(PM, 4, "deob ifield %s %s\n",
+              proguard_name(f).c_str(),
+              pm.deobfuscate_field(proguard_name(f)).c_str());
+        f->set_deobfuscated_name(pm.deobfuscate_field(proguard_name(f)));
+      }
+      for (auto const& f : cls->get_sfields()) {
+        TRACE(PM, 4, "deob sfield %s %s\n",
+              proguard_name(f).c_str(),
+              pm.deobfuscate_field(proguard_name(f)).c_str());
+        f->set_deobfuscated_name(pm.deobfuscate_field(proguard_name(f)));
+      }
+    }
+  }
+}
+
+std::string proguard_name(DexType* type) {
+  return type->get_name()->c_str();
+}
+
+std::string proguard_name(DexClass* cls) {
+  return cls->get_name()->c_str();
+}
+
+std::string proguard_name(DexMethod* method) {
+  // Format is <class descriptor>.<method name>(<arg descriptors>)<return descriptor>
+  auto str = proguard_name(method->get_class()) + "." + method->get_name()->c_str();
+
+  auto proto = method->get_proto();
+  auto args_str = std::string("(");
+
+  for (auto& arg_type: proto->get_args()->get_type_list()) {
+    args_str += proguard_name(arg_type);
+  }
+  args_str += ")";
+
+  auto ret_str = proguard_name(proto->get_rtype());
+  return str + args_str + ret_str;
+}
+
+std::string proguard_name(DexField* field) {
+  auto str = proguard_name(field->get_class()) + "."
+    + field->get_name()->c_str() + ":"
+    + proguard_name(field->get_type());
+
+  return str;
+}
+
+std::string convert_type(std::string type) {
+  auto dimpos = type.find('[');
+  if (dimpos == std::string::npos) {
+    return convert_scalar_type(type);
+  }
+  auto ndims = std::count(type.begin() + dimpos, type.end(), '[');
+  std::string res(ndims, '[');
+  return res + convert_scalar_type(type.substr(0, dimpos));
 }

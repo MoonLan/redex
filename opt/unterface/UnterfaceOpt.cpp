@@ -12,7 +12,7 @@
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "Creators.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
 
@@ -101,10 +101,10 @@ bool find_impl(DexType* type, Unterface& unterface) {
  * scenario.
  */
 void do_update_method(DexMethod* meth, Unterface& unterface) {
-  auto code = meth->get_code();
+  auto& code = meth->get_code();
   code->set_registers_size(code->get_registers_size() + 1);
   auto mt = MethodTransform::get_method_transform(meth);
-  DexOpcode* last = nullptr;
+  DexInstruction* last = nullptr;
   for (auto insn : code->get_instructions()) {
     DexOpcodeMethod* invoke = nullptr;
     auto op = insn->opcode();
@@ -126,7 +126,7 @@ void do_update_method(DexMethod* meth, Unterface& unterface) {
       for (size_t i = 0; i < unterface.impls.size(); i++) {
         auto impl = unterface.impls[i];
         if (impl->get_type() == cls) {
-          auto load = new DexOpcode(OPCODE_CONST_16);
+          auto load = new DexInstruction(OPCODE_CONST_16);
           load->set_dest(0);
           load->set_literal(static_cast<int32_t>(i));
           invoke = new DexOpcodeMethod(OPCODE_INVOKE_DIRECT,
@@ -141,7 +141,7 @@ void do_update_method(DexMethod* meth, Unterface& unterface) {
           }
           invoke->set_src(arg_count, 0);
           mt->remove_opcode(insn);
-          std::list<DexOpcode*> new_insns;
+          std::list<DexInstruction*> new_insns;
           new_insns.push_back(load);
           new_insns.push_back(invoke);
           mt->insert_after(last, new_insns);
@@ -186,8 +186,8 @@ void update_impl_refereces(Scope& scope, Unterface& unterface) {
       [&](DexMethod* meth) {
         return !find_impl(meth->get_class(), unterface);
       },
-      [&](DexMethod* meth, DexCode* code) {
-        auto insns = code->get_instructions();
+      [&](DexMethod* meth, const DexCode& code) {
+        const auto insns = code.get_instructions();
         for (auto insn : insns) {
           auto op = insn->opcode();
           switch (op) {
@@ -284,7 +284,7 @@ void build_invoke(Unterface& unterface) {
     for (int idx = 0; idx < static_cast<int>(unterface.impls.size()); idx++) {
       cases[idx] = nullptr;
     }
-    auto def_block = mb->swtich_op(switch_loc, cases);
+    auto def_block = mb->switch_op(switch_loc, cases);
     if (ret != get_void_type()) {
       def_block->load_null(ret_loc);
       mb->ret(ret_loc);
@@ -341,7 +341,7 @@ void update_code(DexClass* cls, DexMethod* meth, DexField* new_field) {
     mt->replace_opcode(fop, new_fop);
     DexOpcodeType* check_cast = new DexOpcodeType(OPCODE_CHECK_CAST, type);
     check_cast->set_src(0, dst);
-    std::list<DexOpcode*> ops;
+    std::list<DexInstruction*> ops;
     ops.push_back(check_cast);
     TRACE(UNTF, 8, "Changed %s to\n%s\n%s\n", show(fop).c_str(),
         show(new_fop).c_str(), show(check_cast).c_str());

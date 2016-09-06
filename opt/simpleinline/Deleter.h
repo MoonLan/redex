@@ -12,7 +12,7 @@
 #include "DexClass.h"
 #include "Resolver.h"
 #include <functional>
-#include <unordered_set>
+#include <set>
 #include <vector>
 
 /**

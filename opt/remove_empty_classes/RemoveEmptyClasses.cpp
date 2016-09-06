@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <unordered_set>
 
-#include "walkers.h"
+#include "Walkers.h"
 #include "ReachableClasses.h"
 #include "RemoveEmptyClasses.h"
 #include "DexClass.h"
@@ -27,7 +27,6 @@ bool is_empty_class(DexClass* cls,
   TRACE(EMPTY, 4, ">> Empty Analysis for %s\n", name);
   TRACE(EMPTY, 4, "   no methods or fields: %d\n", empty_class);
   TRACE(EMPTY, 4, "   can delete: %d\n", can_delete(cls));
-  TRACE(EMPTY, 4, "   !do not strip: %d\n", !do_not_strip(cls));
   TRACE(EMPTY, 4, "   not interface: %d\n",
       !(access & DexAccessFlags::ACC_INTERFACE));
   TRACE(EMPTY, 4, "   references: %d\n",
@@ -35,7 +34,6 @@ bool is_empty_class(DexClass* cls,
   bool remove =
          empty_class &&
          can_delete(cls) &&
-         !do_not_strip(cls) &&
          !(access & DexAccessFlags::ACC_INTERFACE) &&
          class_references.count(cls->get_type()) == 0;
   TRACE(EMPTY, 4, "   remove: %d\n", remove);
@@ -59,27 +57,53 @@ void process_annotation(std::unordered_set<const DexType*>* class_references,
     }
 }
 
+DexType* array_base_type(DexType* type) {
+  while (is_array(type)) {
+    type = get_array_type(type);
+  }
+  return type;
+}
+
+void process_proto(std::unordered_set<const DexType*>* class_references,
+                   DexMethod* meth) {
+  // Types referenced in protos.
+  auto const& proto = meth->get_proto();
+  class_references->insert(array_base_type(proto->get_rtype()));
+  for (auto const& ptype : proto->get_args()->get_type_list()) {
+    class_references->insert(array_base_type(ptype));
+  }
+}  
+
 void process_code(std::unordered_set<const DexType*>* class_references,
-  DexMethod* meth, DexCode* code) {
-    auto opcodes = code->get_instructions();
-    for (const auto& opcode : opcodes) {
-      if (opcode->has_types()) {
-        auto typeop = static_cast<DexOpcodeType*>(opcode);
-        auto typ = typeop->get_type();
-        while (is_array(typ)) {
-          typ = get_array_type(typ);
-        }
-        TRACE(EMPTY, 4, "Adding type from code to keep list: %s\n",
-              typ->get_name()->c_str());
-        class_references->insert(typ);
-      }
+                  DexMethod* meth,
+                  DexCode& code) {
+  process_proto(class_references, meth);
+  // Types referenced in code.
+  auto opcodes = code.get_instructions();
+  for (const auto& opcode : opcodes) {
+    if (opcode->has_types()) {
+      auto typeop = static_cast<DexOpcodeType*>(opcode);
+      auto typ = array_base_type(typeop->get_type());
+      TRACE(EMPTY, 4, "Adding type from code to keep list: %s\n",
+            typ->get_name()->c_str());
+      class_references->insert(typ);
     }
-    // Also gather exception types that are caught.
-    std::vector<DexType*> catch_types;
-    code->gather_catch_types(catch_types);
-    for (auto&  caught_type : catch_types) {
-       class_references->insert(caught_type);
+    if (opcode->has_fields()) {
+      auto const& field = static_cast<DexOpcodeField*>(opcode)->field();
+      class_references->insert(array_base_type(field->get_class()));
+      class_references->insert(array_base_type(field->get_type()));
     }
+    if (opcode->has_methods()) {
+      auto const& m = static_cast<DexOpcodeMethod*>(opcode)->get_method();
+      process_proto(class_references, m);
+    }
+  }
+  // Also gather exception types that are caught.
+  std::vector<DexType*> catch_types;
+  code.gather_catch_types(catch_types);
+  for (auto& caught_type : catch_types) {
+    class_references->insert(caught_type);
+  }
 }
 
 void remove_empty_classes(Scope& classes) {
@@ -93,8 +117,8 @@ void remove_empty_classes(Scope& classes) {
 
   walk_code(classes,
             [](DexMethod*) { return true; },
-            [&](DexMethod* meth, DexCode* code)
-               { process_code (&class_references, meth, code); });
+            [&](DexMethod* meth, DexCode& code)
+               { process_code(&class_references, meth, code); });
 
   size_t classes_before_size = classes.size();
 
@@ -114,8 +138,8 @@ void remove_empty_classes(Scope& classes) {
 }
 
 void RemoveEmptyClassesPass::run_pass(
-    DexClassesVector& dexen, ConfigFiles& cfg) {
-  auto scope = build_class_scope(dexen);
+    DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  auto scope = build_class_scope(stores);
   remove_empty_classes(scope);
-  post_dexen_changes(scope, dexen);
+  post_dexen_changes(scope, stores);
 }

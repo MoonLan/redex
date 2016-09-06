@@ -15,31 +15,12 @@
 #include <fstream>
 #include <string>
 
-#include "walkers.h"
+#include "Walkers.h"
 #include "DexClass.h"
-#include "Predicate.h"
 #include "RedexResources.h"
+#include "StringUtil.h"
 
 namespace {
-
-std::unordered_set<DexField*> do_not_strip_fields;
-std::unordered_set<DexMethod*> do_not_strip_methods;
-std::unordered_set<DexClass*> do_not_strip_classes;
-
-// Note: this method will return nullptr if the dotname refers to an unknown
-// type.
-DexType* get_dextype_from_dotname(const char* dotname) {
-  if (dotname == nullptr) {
-    return nullptr;
-  }
-  std::string buf;
-  buf.reserve(strlen(dotname) + 2);
-  buf += 'L';
-  buf += dotname;
-  buf += ';';
-  std::replace(buf.begin(), buf.end(), '.', '/');
-  return DexType::get_type(buf.c_str());
-}
 
 /**
  * Class is used directly in code (As opposed to used via reflection)
@@ -70,9 +51,9 @@ void mark_reachable_directly(DexClass* dclass) {
   }
 }
 
-void mark_reachable_directly(DexType* dtype) {
-  if (dtype == nullptr) return;
-  mark_reachable_directly(type_class_internal(dtype));
+template<typename DexMember>
+void mark_only_reachable_directly(DexMember* m) {
+   m->rstate.ref_by_type();
 }
 
 /**
@@ -115,21 +96,31 @@ void mark_reachable_by_classname(DexType* dtype, bool from_code) {
 
 void mark_reachable_by_classname(std::string& classname, bool from_code) {
   DexString* dstring =
-      DexString::get_string(classname.c_str(), classname.size());
+      DexString::get_string(classname.c_str(), (uint32_t)classname.size());
   DexType* dtype = DexType::get_type(dstring);
   if (dtype == nullptr) return;
   DexClass* dclass = type_class_internal(dtype);
   mark_reachable_by_classname(dclass, from_code);
 }
 
-void mark_reachable_by_seed(DexClass* dclass) {
+template<typename T>
+void mark_reachable_by_seed(T dclass) {
   if (dclass == nullptr) return;
   dclass->rstate.ref_by_seed();
+}
+
+template<typename T>
+void mark_reachable_by_renamed_seed(T t) {
+  if (t) t->rstate.ref_by_renamed_seed();
 }
 
 void mark_reachable_by_seed(DexType* dtype) {
   if (dtype == nullptr) return;
   mark_reachable_by_seed(type_class_internal(dtype));
+}
+
+void mark_reachable_by_renamed_seed(DexType* dtype) {
+  mark_reachable_by_renamed_seed(type_class_internal(dtype));
 }
 
 template <typename DexMember>
@@ -154,53 +145,67 @@ void keep_annotated_classes(
 ) {
   for (auto const& cls : scope) {
     if (anno_set_contains(cls, keep_annotations)) {
-      do_not_strip_classes.insert(cls);
+      mark_only_reachable_directly(cls);
     }
     for (auto const& m : cls->get_dmethods()) {
       if (anno_set_contains(m, keep_annotations)) {
-        do_not_strip_methods.insert(m);
+        mark_only_reachable_directly(m);
       }
     }
     for (auto const& m : cls->get_vmethods()) {
       if (anno_set_contains(m, keep_annotations)) {
-        do_not_strip_methods.insert(m);
+        mark_only_reachable_directly(m);
       }
     }
     for (auto const& m : cls->get_sfields()) {
       if (anno_set_contains(m, keep_annotations)) {
-        do_not_strip_fields.insert(m);
+        mark_only_reachable_directly(m);
       }
     }
     for (auto const& m : cls->get_ifields()) {
       if (anno_set_contains(m, keep_annotations)) {
-        do_not_strip_fields.insert(m);
+        mark_only_reachable_directly(m);
       }
     }
   }
 }
 
-void keep_packages(
-  const Scope& scope,
-  const std::vector<std::string>& keep_pkgs
-) {
+/*
+ * This method handles the keep_class_members from the configuration file.
+ */
+void keep_class_members(
+    const Scope& scope,
+    const std::vector<std::string>& keep_class_mems) {
   for (auto const& cls : scope) {
-    auto name = cls->get_type()->get_name()->c_str();
-    for (auto const& pkg : keep_pkgs) {
-      if (strstr(name, pkg.c_str())) {
-        do_not_strip_classes.insert(cls);
-        for (auto const& m : cls->get_dmethods()) {
-          do_not_strip_methods.insert(m);
-        }
-        for (auto const& m : cls->get_vmethods()) {
-          do_not_strip_methods.insert(m);
-        }
+    std::string name = std::string(cls->get_type()->get_name()->c_str());
+    for (auto const& class_mem : keep_class_mems) {
+      std::string class_mem_str = std::string(class_mem.c_str());
+      std::size_t pos = class_mem_str.find(name);
+      if (pos != std::string::npos) {
+        std::string rem_str = class_mem_str.substr(pos+name.size());
         for (auto const& f : cls->get_sfields()) {
-          do_not_strip_fields.insert(f);
-        }
-        for (auto const& f : cls->get_ifields()) {
-          do_not_strip_fields.insert(f);
+          if (rem_str.find(std::string(f->get_name()->c_str()))!=std::string::npos) {
+            mark_only_reachable_directly(f);
+            mark_only_reachable_directly(cls);
+          }
         }
         break;
+      }
+    }
+  }
+}
+
+void keep_methods(const Scope& scope, const std::vector<std::string>& ms) {
+  std::set<std::string> methods_to_keep(ms.begin(), ms.end());
+  for (auto const& cls : scope) {
+    for (auto& m : cls->get_dmethods()) {
+      if (methods_to_keep.count(m->get_name()->c_str())) {
+        m->rstate.ref_by_string(false);
+      }
+    }
+    for (auto& m : cls->get_vmethods()) {
+      if (methods_to_keep.count(m->get_name()->c_str())) {
+        m->rstate.ref_by_string(false);
       }
     }
   }
@@ -237,66 +242,58 @@ bool in_reflected_pkg(DexClass* dclass,
  *  - Classes reachable from native libraries
  */
 void init_permanently_reachable_classes(
-    const Scope& scope,
-    folly::dynamic& config,
-    const std::vector<KeepRule>& proguard_rules,
-    const std::unordered_set<DexType*>& no_optimizations_anno) {
+  const Scope& scope,
+  const Json::Value& config,
+  const std::vector<KeepRule>& proguard_rules,
+  const std::unordered_set<DexType*>& no_optimizations_anno
+) {
+  PassConfig pc(config);
 
   std::string apk_dir;
   std::vector<std::string> reflected_package_names;
+  std::vector<std::string> annotations;
+  std::vector<std::string> class_members;
+  std::vector<std::string> methods;
 
-  auto config_apk_dir = config.find("apk_dir");
-  if (config_apk_dir != config.items().end()) {
-    apk_dir = toStdString(config_apk_dir->second.asString());
+  pc.get("apk_dir", "", apk_dir);
+  pc.get("keep_packages", {}, reflected_package_names);
+  pc.get("keep_annotations", {}, annotations);
+  pc.get("keep_class_members", {}, class_members);
+  pc.get("keep_methods", {}, methods);
+
+  std::unordered_set<DexType*> annotation_types(
+    no_optimizations_anno.begin(),
+    no_optimizations_anno.end());
+
+  for (auto const& annostr : annotations) {
+    DexType* anno = DexType::get_type(annostr.c_str());
+    if (anno) annotation_types.insert(anno);
   }
 
-  auto config_reflected_package_names = config.find("reflected_packages");
-  if (config_reflected_package_names != config.items().end()) {
-    for (auto config_pkg_name : config_reflected_package_names->second) {
-      std::string pkg_name = toStdString(config_pkg_name.asString());
-      reflected_package_names.push_back(pkg_name);
-    }
-  }
-
-  std::unordered_set<DexType*> keep_annotations;
-  auto config_keep_annotations = config.find("keep_annotations");
-  if (config_keep_annotations != config.items().end()) {
-    for (auto const& config_anno_name : config_keep_annotations->second) {
-      std::string anno_name = toStdString(config_anno_name.asString());
-      DexType* anno = DexType::get_type(anno_name.c_str());
-      if (anno) keep_annotations.insert(anno);
-    }
-  }
-  for (const auto& anno : no_optimizations_anno) {
-    keep_annotations.insert(anno);
-  }
-  keep_annotated_classes(scope, keep_annotations);
-
-  std::vector<std::string> keep_pkgs;
-  auto config_keep_packages = config.find("keep_packages");
-  if (config_keep_packages != config.items().end()) {
-    for (auto const& config_pkg : config_keep_packages->second) {
-      auto pkg_name = toStdString(config_pkg.asString());
-      keep_pkgs.push_back(pkg_name);
-    }
-  }
-  keep_packages(scope, keep_pkgs);
+  keep_annotated_classes(scope, annotation_types);
+  keep_class_members(scope, class_members);
+  keep_methods(scope, methods);
 
   if (apk_dir.size()) {
     // Classes present in manifest
     std::string manifest = apk_dir + std::string("/AndroidManifest.xml");
     for (std::string classname : get_manifest_classes(manifest)) {
+      TRACE(PGR, 3, "manifest: %s\n", classname.c_str());
       mark_reachable_by_classname(classname, false);
     }
 
     // Classes present in XML layouts
     for (std::string classname : get_layout_classes(apk_dir)) {
+      TRACE(PGR, 3, "xml_layout: %s\n", classname.c_str());
       mark_reachable_by_classname(classname, false);
     }
 
     // Classnames present in native libraries (lib/*/*.so)
     for (std::string classname : get_native_classes(apk_dir)) {
-      mark_reachable_by_classname(classname, false);
+      auto type = DexType::get_type(classname.c_str());
+      if (type == nullptr) continue;
+      TRACE(PGR, 3, "native_lib: %s\n", classname.c_str());
+      mark_reachable_by_classname(type, false);
     }
   }
 
@@ -319,6 +316,7 @@ void init_permanently_reachable_classes(
        * them currently.  So, we mark with the most
        * conservative sense here.
        */
+      TRACE(PGR, 3, "reflected_package: %s\n", SHOW(clazz));
       mark_reachable_by_classname(clazz, false);
     }
   }
@@ -335,12 +333,13 @@ void init_permanently_reachable_classes(
   std::vector<std::string> cls_patterns;
   for (auto const& r : proguard_rules) {
     if (r.classname != nullptr &&
-        r.class_type == keeprules::ClassType::CLASS &&
+        (r.class_type == keeprules::ClassType::CLASS ||
+         r.class_type == keeprules::ClassType::INTERFACE) &&
           strlen(r.classname) > 2) {
       std::string cls_pattern(r.classname);
       std::replace(cls_pattern.begin(), cls_pattern.end(), '.', '/');
       auto prep_pat = 'L' + cls_pattern;
-      TRACE(PGR, 1, "adding pattern %s \n", prep_pat.c_str());
+      TRACE(PGR, 2, "adding pattern %s \n", prep_pat.c_str());
       cls_patterns.push_back(prep_pat);
     }
   }
@@ -349,7 +348,7 @@ void init_permanently_reachable_classes(
     auto cname = clazz->get_type()->get_name()->c_str();
     auto cls_len = strlen(cname);
     for (auto const& pat : cls_patterns) {
-        int pat_len = pat.size();
+        size_t pat_len = pat.size();
         if (type_matches(pat.c_str(), cname, pat_len, cls_len)) {
           mark_reachable_directly(clazz);
           TRACE(PGR, 2, "matched cls %s against pattern %s \n",
@@ -374,150 +373,19 @@ void init_permanently_reachable_classes(
  * after each pass.
  */
 void recompute_classes_reachable_from_code(const Scope& scope) {
-  for (auto clazz : scope) {
-    clazz->rstate.clear_if_compute();
-  }
-
-  std::unordered_set<DexString*> maybetypes;
-  walk_annotations(scope,
-      [&](DexAnnotation* anno) {
-        static DexType* dalviksig =
-            DexType::get_type("Ldalvik/annotation/Signature;");
-        // Signature annotations contain strings that Jackson uses
-        // to construct the underlying types.  We capture the
-        // full list here, and mark them later.  (There are many
-        // duplicates, so de-duping before we look it up as a
-        // class makes sense)
-        if (anno->type() == dalviksig) {
-          auto elems = anno->anno_elems();
-          for (auto const& elem : elems) {
-            auto ev = elem.encoded_value;
-            if (ev->evtype() != DEVT_ARRAY) continue;
-            auto arrayev = static_cast<DexEncodedValueArray*>(ev);
-            auto const& evs = arrayev->evalues();
-            for (auto strev : *evs) {
-              if (strev->evtype() != DEVT_STRING) continue;
-              auto stringev =
-              static_cast<DexEncodedValueString*>(strev);
-              maybetypes.insert((DexString*)stringev->string());
-            }
-          }
-          return;
-        }
-        // Class literals in annotations.
-        //
-        // Example:
-        //    @JsonDeserialize(using=MyJsonDeserializer.class)
-        //                                   ^^^^
-        if (anno->runtime_visible()) {
-          auto elems = anno->anno_elems();
-          for (auto const& dae : elems) {
-            auto evalue = dae.encoded_value;
-            std::vector<DexType*> ltype;
-            evalue->gather_types(ltype);
-            if (ltype.size()) {
-              for (auto dextype : ltype) {
-                mark_reachable_directly(dextype);
-              }
-            }
-          }
-        }
-      });
-
-  // Now we process the strings that were in the signature
-  // annotations.
-  // Note: We do not mark these as ref'd by string, because
-  // these cases are handleable for renaming.
-  for (auto dstring : maybetypes) {
-    const char* cstr = dstring->c_str();
-    int len = strlen(cstr);
-    if (len < 3) continue;
-    if (cstr[0] != 'L') continue;
-    if (cstr[len - 1] == ';') {
-      auto dtype = DexType::get_type(dstring);
-      mark_reachable_directly(dtype);
-      continue;
-    }
-    std::string buf(cstr);
-    buf += ';';
-    auto dtype = DexType::get_type(buf.c_str());
-    mark_reachable_directly(dtype);
-  }
-
   // Matches methods marked as native
   walk_methods(scope,
                [&](DexMethod* meth) {
                  if (meth->get_access() & DexAccessFlags::ACC_NATIVE) {
+                   TRACE(PGR, 3, "native_method: %s\n", SHOW(meth->get_class()));
                    mark_reachable_by_classname(meth->get_class(), true);
                  }
                });
-
-  walk_code(scope,
-            [](DexMethod*) { return true; },
-            [&](DexMethod* meth, DexCode* code) {
-              auto opcodes = code->get_instructions();
-              for (const auto& opcode : opcodes) {
-                // Matches any stringref that name-aliases a type.
-                if (opcode->has_strings()) {
-                  auto stringop = static_cast<DexOpcodeString*>(opcode);
-                  DexString* dsclzref = stringop->get_string();
-                  DexType* dtexclude =
-                      get_dextype_from_dotname(dsclzref->c_str());
-                  if (dtexclude == nullptr) continue;
-                  mark_reachable_by_classname(dtexclude, true);
-                }
-                if (opcode->has_types()) {
-                  // Matches the following instructions (from most to least
-                  // common):
-                  // check-cast, new-instance, const-class, instance-of
-                  // new-instance should not be on this list, and
-                  // we should not allow these to operate on themselves.
-                  // TODO(snay/dalves)
-                  auto typeop = static_cast<DexOpcodeType*>(opcode);
-                  mark_reachable_directly(typeop->get_type());
-                }
-              }
-            });
-}
-
-void reportReachableClasses(const Scope& scope, std::string reportFileName) {
-  TRACE(PGR, 4, "Total numner of classes: %d\n", scope.size());
-  // First report keep annotations
-  std::ofstream reportFileDNS(reportFileName + ".dns");
-  for (auto const& dns : do_not_strip_classes) {
-    reportFileDNS << "Do not strip class: " <<
-        dns->get_type()->get_name()->c_str() << "\n";
-  }
-  reportFileDNS.close();
-  // Report classes that the reflection filter says can't be deleted.
-  std::ofstream reportFileCanDelete(reportFileName + ".cant_delete");
-  for (auto const& cls : scope) {
-    if (!can_delete(cls)) {
-      reportFileCanDelete << cls->get_name()->c_str() << "\n";
-    }
-  }
-  reportFileCanDelete.close();
-  // Report classes that the reflection filter says can't be renamed.
-  std::ofstream reportFileCanRename(reportFileName + ".cant_rename");
-  for (auto const& cls : scope) {
-    if (!can_rename(cls)) {
-      reportFileCanRename << cls->get_name()->c_str() << "\n";
-    }
-  }
-  reportFileCanRename.close();
-  // Report classes marked for keep from ProGuard flat file list.
-  std::ofstream reportFileKeep(reportFileName + ".must_keep");
-  for (auto const& cls : scope) {
-    if (is_seed(cls)) {
-      reportFileKeep << cls->get_name()->c_str() << "\n";
-    }
-  }
-  reportFileKeep.close();
 }
 
 void init_reachable_classes(
     const Scope& scope,
-    folly::dynamic& config,
+    const Json::Value& config,
     const std::vector<KeepRule>& proguard_rules,
     const std::unordered_set<DexType*>& no_optimizations_anno) {
   // Find classes that are reachable in such a way that none of the redex
@@ -532,51 +400,189 @@ void init_reachable_classes(
   recompute_classes_reachable_from_code(scope);
 }
 
-void init_seed_classes(const std::string seeds_filename) {
-    TRACE(PGR, 1, "Reading seed classes from %s\n", seeds_filename.c_str());
-    auto start = std::chrono::high_resolution_clock::now();
-    std::ifstream seeds_file(seeds_filename);
-    uint count = 0;
-    if (!seeds_file) {
-      TRACE(PGR, 1, "Seeds file %s was not found (ignoring error).",
-          seeds_filename.c_str());
-    } else {
-      std::string line;
-      while (getline(seeds_file, line)) {
-        if (line.find(":") == std::string::npos && line.find("$") ==
-            std::string::npos) {
-          auto dex_type = get_dextype_from_dotname(line.c_str());
-          if (dex_type != nullptr) {
-            mark_reachable_by_seed(dex_type);
-            count++;
-          } else {
-            TRACE(PGR, 1,
-                "Seed file contains class for which "
-                "Dex type can't be found: %s\n",
-                line.c_str());
-          }
-        }
-      }
-      seeds_file.close();
+namespace {
+struct SeedsParser {
+  SeedsParser(const ProguardMap& pgmap) : m_pgmap(pgmap) {}
+
+  bool parse_seed_line(std::string line) {
+    if (line.find(':') == std::string::npos) {
+      return parse_class(line);
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    TRACE(PGR, 1, "Read %d seed classes in %.1lf seconds\n", count,
-          std::chrono::duration<double>(end - start).count());
+    if (line.find('(') == std::string::npos) {
+      return parse_field(line);
+    }
+    return parse_method(line);
+  }
+
+ private:
+  bool parse_class(std::string line) {
+    auto canon_name = convert_type(line);
+    auto xlate_name = m_pgmap.translate_class(canon_name);
+    auto dex_type = DexType::get_type(xlate_name.c_str());
+    TRACE(PGR, 2,
+          "Parsing seed class: %s\n"
+          "  canon: %s\n"
+          "  xlate: %s\n"
+          "  interned: %s\n",
+          line.c_str(), canon_name.c_str(), xlate_name.c_str(), SHOW(dex_type));
+    auto nonrenamed_type = DexType::get_type(canon_name.c_str());
+    if (!dex_type && !nonrenamed_type) {
+      TRACE(PGR, 2,
+            "Seed file contains class for which Dex type can't be found: %s\n",
+            line.c_str());
+      return false;
+    }
+    if (dex_type) {
+      mark_reachable_by_renamed_seed(dex_type);
+    }
+    if (line.find('$') == std::string::npos) {
+      if (nonrenamed_type) {
+        mark_reachable_by_seed(nonrenamed_type);
+      }
+    }
+    return true;
+  }
+
+  std::string convert_field(
+    std::string cls,
+    std::string type,
+    std::string name
+  ) {
+    return convert_type(cls) + "." + name + ":" + convert_type(type);
+  }
+
+  std::string canonicalize_field(std::string line) {
+    auto cpos = line.find(':');
+    auto cls = line.substr(0, cpos);
+    auto spos = line.find(' ', cpos + 2);
+    auto type = line.substr(cpos + 2, spos - (cpos + 2));
+    auto name = line.substr(spos + 1);
+    return convert_field(cls, type, name);
+  }
+
+  bool parse_field(std::string line) {
+    auto canon_field = canonicalize_field(line);
+    auto xlate_name = m_pgmap.translate_field(canon_field);
+    auto cls_end = xlate_name.find('.');
+    auto name_start = cls_end + 1;
+    auto name_end = xlate_name.find(':', name_start);
+    auto type_start = name_end + 1;
+    auto clsstr = xlate_name.substr(0, cls_end);
+    auto namestr = xlate_name.substr(name_start, name_end - name_start);
+    auto typestr = xlate_name.substr(type_start);
+    auto dex_field = DexField::get_field(
+      DexType::get_type(clsstr.c_str()),
+      DexString::get_string(namestr.c_str()),
+      DexType::get_type(typestr.c_str()));
+    TRACE(PGR, 2,
+          "Parsing seed field: %s\n"
+          "  canon: %s\n"
+          "  xlate: %s\n"
+          "  interned: %s\n",
+          line.c_str(), canon_field.c_str(), xlate_name.c_str(),
+          SHOW(dex_field));
+    if (!dex_field) {
+      TRACE(PGR, 2,
+            "Seed file contains field not found in dex: %s (obfuscated: %s)\n",
+            canon_field.c_str(), xlate_name.c_str());
+      return false;
+    }
+    mark_reachable_by_seed(dex_field);
+    return true;
+  }
+
+  std::string convert_args(std::string args) {
+    std::string ret;
+    std::stringstream ss(args);
+    std::string arg;
+    while (std::getline(ss, arg, ',')) {
+      ret += convert_type(arg);
+    }
+    return ret;
+  }
+
+  std::string convert_method(
+    std::string cls,
+    std::string type,
+    std::string name,
+    std::string args
+  ) {
+    return
+      convert_type(cls)
+      + "." + name
+      + "(" + convert_args(args) + ")"
+      + convert_type(type);
+  }
+
+  std::string canonicalize_method(std::string line) {
+    auto cls_end = line.find(':');
+    auto type_start = cls_end + 2;
+    auto type_end = line.find(' ', type_start);
+    if (type_end == std::string::npos) {
+      // It's an <init> constructor.
+      auto args_start = line.find('(', type_start) + 1;
+      auto args_end = line.find(')', args_start);
+      auto cls = line.substr(0, cls_end);
+      auto args = line.substr(args_start, args_end - args_start);
+      return convert_method(cls, "void", "<init>", args);
+    }
+    auto name_start = type_end + 1;
+    auto name_end = line.find('(', name_start);
+    auto args_start = name_end + 1;
+    auto args_end = line.find(')', args_start);
+    auto cls = line.substr(0, cls_end);
+    auto type = line.substr(type_start, type_end - type_start);
+    auto name = line.substr(name_start, name_end - name_start);
+    auto args = line.substr(args_start, args_end - args_start);
+    return convert_method(cls, type, name, args);
+  }
+
+  bool parse_method(std::string line) {
+    auto canon_method = canonicalize_method(line);
+    auto xlate_method = m_pgmap.translate_method(canon_method);
+    auto dex_method = DexMethod::get_method(xlate_method);
+    TRACE(PGR, 2,
+          "Parsing seed method: %s\n"
+          "  canon: %s\n"
+          "  xlate: %s\n"
+          "  interned: %s\n",
+          line.c_str(), canon_method.c_str(), xlate_method.c_str(),
+          SHOW(dex_method));
+    if (!dex_method) {
+      TRACE(PGR, 2,
+            "Seed file contains method not found in dex: %s (obfuscated: %s)\n",
+            canon_method.c_str(), xlate_method.c_str());
+      return false;
+    }
+    mark_reachable_by_seed(dex_method);
+    return true;
+  }
+
+ private:
+  const ProguardMap& m_pgmap;
+};
 }
 
-/**
- * Note: The do_not_strip() methods here effectively form a separate reachable
- * class/field/method filter. This should be combined into the main
- * can_delete() filter.
- */
-bool do_not_strip(DexField* f) {
-  return do_not_strip_fields.count(f) != 0;
-}
-
-bool do_not_strip(DexMethod* m) {
-  return do_not_strip_methods.count(m) != 0;
-}
-
-bool do_not_strip(DexClass* c) {
-  return do_not_strip_classes.count(c) != 0;
+unsigned int init_seed_classes(
+  const std::string seeds_filename, const ProguardMap& pgmap
+) {
+  TRACE(PGR, 8, "Reading seed classes from %s\n", seeds_filename.c_str());
+  auto start = std::chrono::high_resolution_clock::now();
+  std::ifstream seeds_file(seeds_filename);
+  SeedsParser parser(pgmap);
+  unsigned int count = 0;
+  if (!seeds_file) {
+    TRACE(PGR, 8, "Seeds file %s was not found (ignoring error).",
+          seeds_filename.c_str());
+    return 0;
+  }
+  std::string line;
+  while (getline(seeds_file, line)) {
+    TRACE(PGR, 2, "Parsing seeds line: %s\n", line.c_str());
+    if (parser.parse_seed_line(line)) ++count;
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  TRACE(PGR, 1, "Read %d seed classes in %.1lf seconds\n", count,
+        std::chrono::duration<double>(end - start).count());
+  return count;
 }

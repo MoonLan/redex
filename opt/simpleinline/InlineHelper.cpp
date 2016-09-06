@@ -8,27 +8,13 @@
  */
 
 #include "InlineHelper.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexUtil.h"
+#include "Mutators.h"
 #include "Resolver.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
-
-// debug only struct to track method distribution
-DEBUG_ONLY std::map<DexType*, int> unk_refs;
-DEBUG_ONLY std::map<DexMethod*, int> unk_meths;
-DEBUG_ONLY bool track(DexMethod* meth) {
-  auto type = meth->get_class();
-  auto cls = type_class(type);
-  while (cls != nullptr) {
-    type = cls->get_super_class();
-    cls = type_class(type);
-  }
-  unk_refs[type]++;
-  unk_meths[meth]++;
-  return true;
-}
 
 // add any type on which an access is allowed and safe without accessibility
 // issues
@@ -53,8 +39,8 @@ struct DexTypeCache {
   std::vector<DexType*> cache;
 
   DexTypeCache() {
-    for (size_t i = 0; i < ARRAY_SIZE(safe_types_on_refs); ++i) {
-      auto type = DexType::get_type(safe_types_on_refs[i]);
+    for (auto const safe_type : safe_types_on_refs) {
+      auto type = DexType::get_type(safe_type);
       if (type != nullptr) {
         cache.push_back(type);
       }
@@ -133,18 +119,19 @@ bool method_ok(DexType* type, DexMethod* meth) {
 }
 
 MultiMethodInliner::MultiMethodInliner(
-    std::vector<DexClass*>& scope,
+    const std::vector<DexClass*>& scope,
     DexClasses& primary_dex,
     std::unordered_set<DexMethod*>& candidates,
-    std::function<DexMethod*(DexMethod*, MethodSearch)> resolver)
-        : resolver(resolver) {
+    std::function<DexMethod*(DexMethod*, MethodSearch)> resolver,
+    const Config& config)
+    : resolver(resolver), m_scope(scope), m_config(config) {
   for (const auto& cls : primary_dex) {
     primary.insert(cls->get_type());
   }
   // walk every opcode in scope looking for calls to inlinable candidates
   // and build a map of callers to callees and the reverse callees to callers
   walk_opcodes(scope, [](DexMethod* meth) { return true; },
-      [&](DexMethod* meth, DexOpcode* opcode) {
+      [&](DexMethod* meth, DexInstruction* opcode) {
         if (is_invoke(opcode->opcode())) {
           auto mop = static_cast<DexOpcodeMethod*>(opcode);
           auto callee = resolver(mop->get_method(), opcode_to_search(opcode));
@@ -172,12 +159,16 @@ void MultiMethodInliner::inline_methods() {
   }
   // save all changes made
   MethodTransform::sync_all();
+
+  invoke_direct_to_static();
 }
 
 void MultiMethodInliner::caller_inline(
     DexMethod* caller,
-    std::vector<DexMethod*>& callees,
+    const std::vector<DexMethod*>& callees,
     std::unordered_set<DexMethod*>& visited) {
+  std::vector<DexMethod*> nonrecursive_callees;
+  nonrecursive_callees.reserve(callees.size());
   // recurse into the callees in case they have something to inline on
   // their own. We want to inline bottom up so that a callee is
   // completely resolved by the time it is inlined.
@@ -187,24 +178,25 @@ void MultiMethodInliner::caller_inline(
       info.recursive++;
       continue;
     }
+    nonrecursive_callees.push_back(callee);
+
     auto maybe_caller = caller_callee.find(callee);
     if (maybe_caller != caller_callee.end()) {
       visited.insert(callee);
       caller_inline(callee, maybe_caller->second, visited);
+      visited.erase(callee);
     }
   }
-  if (caller->get_code()->get_tries().size() > 0) {
+  if (!m_config.try_catch_inline && caller->get_code()->get_tries().size() > 0) {
     info.caller_tries++;
     return;
   }
-  InlineContext inline_context(caller);
-  inline_callees(inline_context, callees);
+  inline_callees(caller, nonrecursive_callees);
 }
 
 void MultiMethodInliner::inline_callees(
-    InlineContext& inline_context, std::vector<DexMethod*>& callees) {
+    DexMethod* caller, const std::vector<DexMethod*>& callees) {
   size_t found = 0;
-  auto caller = inline_context.caller;
   auto insns = caller->get_code()->get_instructions();
 
   // walk the caller opcodes collecting all candidates to inline
@@ -229,25 +221,23 @@ void MultiMethodInliner::inline_callees(
   }
 
   // attempt to inline all inlinable candidates
+  InlineContext inline_context(caller, m_config.use_liveness);
   for (auto inlinable : inlinables) {
     auto callee = inlinable.first;
     auto mop = inlinable.second;
 
     if (!is_inlinable(callee, caller)) continue;
 
-    auto op = mop->opcode();
-    if (is_invoke_range(op)) {
-      info.invoke_range++;
-      continue;
-    }
-
     TRACE(MMINL, 4, "inline %s (%d) in %s (%d)\n",
         SHOW(callee), caller->get_code()->get_registers_size(),
         SHOW(caller),
         callee->get_code()->get_registers_size() -
         callee->get_code()->get_ins_size());
+    if (!MethodTransform::inline_16regs(inline_context, callee, mop)) {
+      info.more_than_16regs++;
+      continue;
+    }
     change_visibility(callee);
-    MethodTransform::inline_16regs(inline_context, callee, mop);
     info.calls_inlined++;
     inlined.insert(callee);
   }
@@ -261,41 +251,31 @@ bool MultiMethodInliner::is_inlinable(DexMethod* callee, DexMethod* caller) {
   if (primary.count(caller->get_class()) != 0 && refs_not_in_primary(callee)) {
     return false;
   }
-  if (is_enum_method(callee)) return false;
-  if (over_16regs(caller, callee)) return false;
-  if (has_try_catch(callee)) return false;
-
-  if (cannot_inline_opcodes(callee)) return false;
+  if (is_blacklisted(callee)) return false;
+  if (!m_config.try_catch_inline && has_try_catch(callee)) return false;
+  if (m_config.try_catch_inline && has_external_catch(callee)) return false;
+  if (cannot_inline_opcodes(callee, caller)) return false;
 
   return true;
 }
 
 /**
- * Return whether the method is in an Enum class.
- * Enum methods are invoked in different magic ways and should never
- * be removed.
+ * Return whether the method or any of its ancestors are in the blacklist.
+ * Typically used to prevent inlining / deletion of methods that are called
+ * via reflection.
  */
-bool MultiMethodInliner::is_enum_method(DexMethod* callee) {
-  if (type_class(callee->get_class())->get_super_class() == get_enum_type()) {
-    info.enum_callee++;
+bool MultiMethodInliner::is_blacklisted(DexMethod* callee) {
+  auto cls = type_class(callee->get_class());
+  // Enums are all blacklisted
+  if (cls->get_access() & ACC_ENUM) {
     return true;
   }
-  return false;
-}
-
-/**
- * Return whether the number of registers to add to the caller, in order to
- * accommodate the callee, would spill over 16 registers.
- * More than 16 registers require special bytecodes for some operations and we
- * do not manage it now.
- */
-bool MultiMethodInliner::over_16regs(DexMethod* caller, DexMethod* callee) {
-  auto regs = caller->get_code()->get_registers_size();
-  regs += (callee->get_code()->get_registers_size() -
-      callee->get_code()->get_ins_size());
-  if (regs > 16) {
-    info.more_than_16regs++;
-    return true;
+  while (cls != nullptr) {
+    if (m_config.black_list.count(cls->get_type())) {
+      info.blacklisted++;
+      return true;
+    }
+    cls = type_class(cls->get_super_class());
   }
   return false;
 }
@@ -314,19 +294,35 @@ bool MultiMethodInliner::has_try_catch(DexMethod* callee) {
 }
 
 /**
+ * Returns true if the callee has catch type which is external and not public,
+ * in which case we cannot inline.
+ */
+bool MultiMethodInliner::has_external_catch(DexMethod* callee) {
+  // Check if catch exception types is external and not public.
+  for(auto &tryit : callee->get_code()->get_tries()) {
+    for (auto const& it : tryit->m_catches) {
+      if (it.first) {
+        auto cls = type_class(it.first);
+        if (cls != nullptr && cls->is_external() && !is_public(cls)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Analyze opcodes in the callee to see if they are problematic for inlining.
  */
-bool MultiMethodInliner::cannot_inline_opcodes(DexMethod* callee) {
+bool MultiMethodInliner::cannot_inline_opcodes(DexMethod* callee,
+                                               DexMethod* caller) {
   int ret_count = 0;
-  auto code = callee->get_code();
-  uint16_t temp_regs =
-      static_cast<uint16_t>(code->get_registers_size() - code->get_ins_size());
   for (auto insn : callee->get_code()->get_instructions()) {
     if (create_vmethod(insn)) return true;
-    if (is_invoke_super(insn)) return true;
-    if (writes_ins_reg(insn, temp_regs)) return true;
-    if (unknown_virtual(insn, callee)) return true;
-    if (unknown_field(insn, callee)) return true;
+    if (nonrelocatable_invoke_super(insn, callee, caller)) return true;
+    if (unknown_virtual(insn, callee, caller)) return true;
+    if (unknown_field(insn, callee, caller)) return true;
     if (insn->opcode() == OPCODE_THROW) {
       info.throws++;
       return true;
@@ -355,7 +351,7 @@ bool MultiMethodInliner::cannot_inline_opcodes(DexMethod* callee) {
  * referenced by a callee is visible and accessible in the caller context.
  * This step would not be needed if we changed all private instance to static.
  */
-bool MultiMethodInliner::create_vmethod(DexOpcode* insn) {
+bool MultiMethodInliner::create_vmethod(DexInstruction* insn) {
   auto opcode = insn->opcode();
   if (opcode == OPCODE_INVOKE_DIRECT || opcode == OPCODE_INVOKE_DIRECT_RANGE) {
     auto method = static_cast<DexOpcodeMethod*>(insn)->get_method();
@@ -373,44 +369,32 @@ bool MultiMethodInliner::create_vmethod(DexOpcode* insn) {
       // concrete ctors we can handle because they stay invoke_direct
       return false;
     }
-    info.need_vmethod++;
-    return true;
+    if (m_config.callee_direct_invoke_inline &&
+        !(method->get_access() & ACC_NATIVE)) {
+      m_make_static.insert(method);
+    } else {
+      info.need_vmethod++;
+      return true;
+    }
   }
   return false;
 }
 
 /**
- * Return whether the callee contains an invoke-super.
+ * Return true if a callee contains an invoke super to a different method
+ * in the hierarchy, and the callee and caller are in different classes.
  * Inlining an invoke_super off its class hierarchy would break the verifier.
  */
-bool MultiMethodInliner::is_invoke_super(DexOpcode* insn) {
+bool MultiMethodInliner::nonrelocatable_invoke_super(DexInstruction* insn,
+                                                     DexMethod* callee,
+                                                     DexMethod* caller) {
   if (insn->opcode() == OPCODE_INVOKE_SUPER ||
       insn->opcode() == OPCODE_INVOKE_SUPER_RANGE) {
+    if (m_config.super_same_class_inline &&
+        callee->get_class() == caller->get_class()) {
+      return false;
+    }
     info.invoke_super++;
-    return true;
-  }
-  return false;
-}
-
-/**
- * Return whether the callee contains a check-cast to or writes one of the ins.
- * When inlining writing over one of the ins may change the type of the
- * register to a type that breaks the invariants in the caller.
- */
-bool MultiMethodInliner::writes_ins_reg(DexOpcode* insn, uint16_t temp_regs) {
-  int reg = -1;
-  if (insn->opcode() == OPCODE_CHECK_CAST) {
-    reg = insn->src(0);
-  } else if (insn->dests_size() > 0) {
-    reg = insn->dest();
-  }
-  // temp_regs are the first n registers in the method that are not ins.
-  // Dx methods use the last k registers for the arguments (where k is the size
-  // of the args).
-  // So an instruction writes an ins if it has a destination and the
-  // destination is bigger or equal than temp_regs (0 is a reg).
-  if (reg >= 0 && static_cast<uint16_t>(reg) >= temp_regs) {
-    info.write_over_ins++;
     return true;
   }
   return false;
@@ -423,7 +407,17 @@ bool MultiMethodInliner::writes_ins_reg(DexOpcode* insn, uint16_t temp_regs) {
  * But we need to make all methods public across the hierarchy and for methods
  * we don't know we have no idea whether the method was public or not anyway.
  */
-bool MultiMethodInliner::unknown_virtual(DexOpcode* insn, DexMethod* context) {
+
+bool MultiMethodInliner::unknown_virtual(DexInstruction* insn,
+                                         DexMethod* callee,
+                                         DexMethod* caller) {
+  // if the caller and callee are in the same class, we don't have to worry
+  // about unknown virtuals -- private / protected methods will remain
+  // accessible
+  if (m_config.virtual_same_class_inline &&
+      caller->get_class() == callee->get_class()) {
+    return false;
+  }
   if (insn->opcode() == OPCODE_INVOKE_VIRTUAL ||
       insn->opcode() == OPCODE_INVOKE_VIRTUAL_RANGE) {
     auto method = static_cast<DexOpcodeMethod*>(insn)->get_method();
@@ -446,7 +440,6 @@ bool MultiMethodInliner::unknown_virtual(DexOpcode* insn, DexMethod* context) {
       }
       if (type_ok(type)) return false;
       if (method_ok(type, method)) return false;
-      assert(track(method));
       info.escaped_virtual++;
       return true;
     }
@@ -465,7 +458,16 @@ bool MultiMethodInliner::unknown_virtual(DexOpcode* insn, DexMethod* context) {
  * But we need to make all fields public across the hierarchy and for fields
  * we don't know we have no idea whether the field was public or not anyway.
  */
-bool MultiMethodInliner::unknown_field(DexOpcode* insn, DexMethod* context) {
+bool MultiMethodInliner::unknown_field(DexInstruction* insn,
+                                       DexMethod* callee,
+                                       DexMethod* caller) {
+  // if the caller and callee are in the same class, we don't have to worry
+  // about unknown fields -- private / protected fields will remain
+  // accessible
+  if (m_config.virtual_same_class_inline &&
+      caller->get_class() == callee->get_class()) {
+    return false;
+  }
   if (is_ifield_op(insn->opcode()) || is_sfield_op(insn->opcode())) {
     auto fop = static_cast<DexOpcodeField*>(insn);
     auto field = fop->field();
@@ -475,7 +477,7 @@ bool MultiMethodInliner::unknown_field(DexOpcode* insn, DexMethod* context) {
       info.escaped_field++;
       return true;
     }
-    if (field->is_external() && !is_public(field)) {
+    if (!field->is_concrete() && !is_public(field)) {
       info.non_pub_field++;
       return true;
     }
@@ -544,7 +546,8 @@ void MultiMethodInliner::change_visibility(DexMethod* callee) {
       SHOW(callee));
   for (auto insn : callee->get_code()->get_instructions()) {
     if (insn->has_fields()) {
-      auto field = static_cast<DexOpcodeField*>(insn)->field();
+      auto fop = static_cast<DexOpcodeField*>(insn);
+      auto field = fop->field();
       field = resolve_field(field, is_sfield_op(insn->opcode())
           ? FieldSearch::Static : FieldSearch::Instance);
       if (field != nullptr && field->is_concrete()) {
@@ -553,11 +556,13 @@ void MultiMethodInliner::change_visibility(DexMethod* callee) {
             SHOW(field->get_type()));
         set_public(field);
         set_public(type_class(field->get_class()));
+        fop->rewrite_field(field);
       }
       continue;
     }
     if (insn->has_methods()) {
-      auto method = static_cast<DexOpcodeMethod*>(insn)->get_method();
+      auto mop = static_cast<DexOpcodeMethod*>(insn);
+      auto method = mop->get_method();
       method = resolver(method, opcode_to_search(insn));
       if (method != nullptr && method->is_concrete()) {
         TRACE(MMINL, 6, "changing visibility of %s.%s: %s\n",
@@ -565,6 +570,7 @@ void MultiMethodInliner::change_visibility(DexMethod* callee) {
             SHOW(method->get_proto()));
         set_public(method);
         set_public(type_class(method->get_class()));
+        mop->rewrite_method(method);
       }
       continue;
     }
@@ -578,5 +584,67 @@ void MultiMethodInliner::change_visibility(DexMethod* callee) {
       continue;
     }
   }
+
+  // Changing visibility of catch exception types.
+  for(auto &tryit : callee->get_code()->get_tries()) {
+    for (auto const& it : tryit->m_catches) {
+      if (it.first) {
+        auto cls = type_class(it.first);
+        if (cls != nullptr && !cls->is_external()) {
+          TRACE(MMINL, 6, "changing visibility of %s\n", SHOW(it.first));
+          set_public(cls);
+        }
+      }
+    }
+  }
 }
 
+namespace {
+
+DexOpcode direct_to_static_op(DexOpcode op) {
+  switch (op) {
+    case OPCODE_INVOKE_DIRECT:
+      return OPCODE_INVOKE_STATIC;
+    case OPCODE_INVOKE_DIRECT_RANGE:
+      return OPCODE_INVOKE_STATIC_RANGE;
+    default:
+      always_assert(false);
+  }
+}
+
+}
+
+void MultiMethodInliner::invoke_direct_to_static() {
+  // We sort the methods here because make_static renames methods on collision,
+  // and which collisions occur is order-dependent. E.g. if we have the
+  // following methods in m_make_static:
+  //
+  //   Foo Foo::bar()
+  //   Foo Foo::bar(Foo f)
+  //
+  // making Foo::bar() static first would make it collide with Foo::bar(Foo f),
+  // causing it to get renamed to bar$redex0(). But if Foo::bar(Foo f) gets
+  // static-ified first, it becomes Foo::bar(Foo f, Foo f), so when bar() gets
+  // made static later there is no collision. So in the interest of having
+  // reproducible binaries, we sort the methods first.
+  //
+  // Also, we didn't use an std::set keyed by method signature here because
+  // make_static is mutating the signatures. The tree that implements the set
+  // would have to be rebalanced after the mutations.
+  std::vector<DexMethod*> methods(m_make_static.begin(), m_make_static.end());
+  std::sort(methods.begin(), methods.end(), compare_dexmethods);
+  for (auto method : methods) {
+    TRACE(MMINL, 6, "making %s static\n", method->get_name()->c_str());
+    mutators::make_static(method);
+  }
+  walk_opcodes(m_scope, [](DexMethod* meth) { return true; },
+      [&](DexMethod* meth, DexInstruction* opcode) {
+        auto op = opcode->opcode();
+        if (op == OPCODE_INVOKE_DIRECT || op == OPCODE_INVOKE_DIRECT_RANGE) {
+          auto mop = static_cast<DexOpcodeMethod*>(opcode);
+          if (m_make_static.count(mop->get_method())) {
+            opcode->set_opcode(direct_to_static_op(op));
+          }
+        }
+      });
+}

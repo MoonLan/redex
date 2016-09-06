@@ -12,6 +12,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <set>
 
 #pragma once
 
@@ -174,6 +175,6 @@ struct KeepRule {
 
 bool pattern_match(const char* pattern, const char* name, int pl, int nl);
 
-bool type_matches(const char* pattern, const char* name, int pl, int nl);
+bool type_matches(const char* pattern, const char* name, size_t pl, size_t nl);
 
-bool parse_proguard_file(const char * input, std::vector<KeepRule>* rules, std::vector<std::string>* library_jars);
+bool parse_proguard_file(const char * input, std::vector<KeepRule>* rules, std::set<std::string>* library_jars);

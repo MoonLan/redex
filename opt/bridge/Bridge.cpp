@@ -21,20 +21,20 @@
 #include "Debug.h"
 #include "DexClass.h"
 #include "DexLoader.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
 #include "PassManager.h"
+#include "ReachableClasses.h"
 #include "Trace.h"
 #include "Transform.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
 
 DexMethod* match_pattern(DexMethod* bridge) {
-  auto code = bridge->get_code();
-  always_assert_log(
-      code, "Bridge method `%s' doesn't contain code", SHOW(bridge));
+  auto& code = bridge->get_code();
+  if (!code) return nullptr;
   auto const& insts = code->get_instructions();
   auto it = insts.begin();
   auto end = insts.end();
@@ -43,12 +43,12 @@ DexMethod* match_pattern(DexMethod* bridge) {
     ++it;
   }
   always_assert_log(it != end, "In %s", SHOW(bridge));
-  auto invoke = static_cast<DexOpcodeMethod*>(*it);
-  if (invoke->opcode() != OPCODE_INVOKE_DIRECT &&
-      invoke->opcode() != OPCODE_INVOKE_STATIC) {
+  if ((*it)->opcode() != OPCODE_INVOKE_DIRECT &&
+      (*it)->opcode() != OPCODE_INVOKE_STATIC) {
     TRACE(BRIDGE, 5, "Rejecting, unhandled pattern: `%s'\n", SHOW(bridge));
     return nullptr;
   }
+  auto invoke = static_cast<DexOpcodeMethod*>(*it);
   ++it;
   if (is_move_result((*it)->opcode())) {
     ++it;
@@ -58,11 +58,15 @@ DexMethod* match_pattern(DexMethod* bridge) {
     return nullptr;
   }
   ++it;
-  always_assert_log(it == end, "In %s", SHOW(bridge));
+  if (it != end) return nullptr;
   return invoke->get_method();
 }
 
 bool is_optimization_candidate(DexMethod* bridge, DexMethod* bridgee) {
+  if (!can_delete(bridgee)) {
+    TRACE(BRIDGE, 5, "Nope nope nope (bridge): %s\nNope nope nope (bridgee): %s\n", SHOW(bridge), SHOW(bridgee));
+    return false;
+  }
   if (!bridgee->get_code()) {
     TRACE(BRIDGE, 5, "Rejecting, bridgee has no code: `%s'\n", SHOW(bridge));
     return false;
@@ -94,9 +98,10 @@ bool signature_matches(DexMethod* a, DexMethod* b) {
 }
 
 bool has_bridgelike_access(DexMethod* m) {
-  return (m->get_access() & ACC_BRIDGE) ||
-         ((m->get_access() & ACC_SYNTHETIC) &&
-          !(m->get_access() & (ACC_STATIC | ACC_CONSTRUCTOR)));
+  return
+    m->is_virtual() &&
+    (is_bridge(m) ||
+     (is_synthetic(m) && !is_static(m) && !is_constructor(m)));
 }
 
 void do_inlining(DexMethod* bridge, DexMethod* bridgee) {
@@ -105,7 +110,7 @@ void do_inlining(DexMethod* bridge, DexMethod* bridgee) {
   auto invoke =
       std::find_if(insts.begin(),
                    insts.end(),
-                   [](const DexOpcode* i) { return is_invoke(i->opcode()); });
+                   [](const DexInstruction* insn) { return is_invoke(insn->opcode()); });
   MethodTransform::inline_tail_call(bridge, bridgee, *invoke);
 }
 }
@@ -241,8 +246,8 @@ class BridgeRemover {
     }
   }
 
-  void exclude_referenced_bridgee(DexMethod* code_method, DexCode* code) {
-    auto const& insts = code->get_instructions();
+  void exclude_referenced_bridgee(DexMethod* code_method, const DexCode& code) {
+    auto const& insts = code.get_instructions();
     for (auto inst : insts) {
       if (!is_invoke(inst->opcode())) continue;
       auto method = static_cast<DexOpcodeMethod*>(inst)->get_method();
@@ -269,7 +274,7 @@ class BridgeRemover {
   void exclude_referenced_bridgees() {
     walk_code(*m_scope,
               [](DexMethod*) { return true; },
-              [&](DexMethod* m, DexCode* code) {
+              [&](DexMethod* m, DexCode& code) {
                 exclude_referenced_bridgee(m, code);
               });
   }
@@ -278,6 +283,7 @@ class BridgeRemover {
     for (auto bpair : m_bridges_to_bridgees) {
       auto bridge = bpair.first;
       auto bridgee = bpair.second;
+      TRACE(BRIDGE, 5, "Inlining %s\n", SHOW(bridge));
       do_inlining(bridge, bridgee);
     }
   }
@@ -316,7 +322,7 @@ class BridgeRemover {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void BridgePass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  Scope scope = build_class_scope(dexen);
+void BridgePass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  Scope scope = build_class_scope(stores);
   BridgeRemover(scope).run();
 }

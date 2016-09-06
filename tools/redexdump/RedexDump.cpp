@@ -41,8 +41,11 @@ static const char ddump_usage_string[] =
     "-x, --code: print items in the code data section\n"
     "-e, --enarr: print items in the encoded array section\n"
     "-A, --anno: print items in the annotation section\n"
+    "-d, --debug: print debug info items in the data section\n"
+    "-D, --ddebug=<addr>: disassemble debug info item at <addr>\n"
     "\nprinting options:\n"
-    "-C, --clean: does not print indexes or offsets making the output "
+    "--clean: does not print indexes or offsets making the output "
+    "--raw: print all bytes, even control characters "
     "usable for a diff\n";
 
 int main(int argc, char* argv[]) {
@@ -59,6 +62,9 @@ int main(int argc, char* argv[]) {
   bool code = false;
   bool enarr = false;
   bool anno = false;
+  bool debug = false;
+  uint32_t ddebug_offset = 0;
+  int no_headers = 0;
 
   char c;
   static const struct option options[] = {
@@ -74,6 +80,11 @@ int main(int argc, char* argv[]) {
     { "code", no_argument, nullptr, 'x' },
     { "enarr", no_argument, nullptr, 'e' },
     { "anno", no_argument, nullptr, 'A' },
+    { "debug", no_argument, nullptr, 'd' },
+    { "ddebug", required_argument, nullptr, 'D' },
+    { "clean", no_argument, (int*)&clean, 1 },
+    { "raw", no_argument, (int*)&raw, 1 },
+    { "no-headers", no_argument, &no_headers, 1 },
     { "help", no_argument, nullptr, 'h' },
     { nullptr, 0, nullptr, 0 },
   };
@@ -81,7 +92,7 @@ int main(int argc, char* argv[]) {
   while ((c = getopt_long(
             argc,
             argv,
-            "asStpfmcCxeAh",
+            "asStpfmcCxeAdDh",
             &options[0],
             nullptr)) != -1) {
     switch (c) {
@@ -121,11 +132,20 @@ int main(int argc, char* argv[]) {
       case 'A':
         anno = true;
         break;
+      case 'd':
+        debug = true;
+        break;
+      case 'D':
+        sscanf(optarg, "%x", &ddebug_offset);
+        break;
       case 'h':
         puts(ddump_usage_string);
         return 0;
       case '?':
         return 1; // getopt_long has printed an error
+      case 0:
+        // we're handling a long-only option
+        break;
       default:
         abort();
     }
@@ -140,7 +160,9 @@ int main(int argc, char* argv[]) {
     const char* dexfile = argv[optind++];
     ddump_data rd;
     open_dex_file(dexfile, &rd);
-    redump(format_map(&rd).c_str());
+    if (!no_headers) {
+      redump(format_map(&rd).c_str());
+    }
     if (string || all) {
       dump_strings(&rd);
     }
@@ -151,19 +173,19 @@ int main(int argc, char* argv[]) {
       dump_types(&rd);
     }
     if (proto || all) {
-      dump_protos(&rd);
+      dump_protos(&rd, !no_headers);
     }
     if (field || all) {
-      dump_fields(&rd);
+      dump_fields(&rd, !no_headers);
     }
     if (meth || all) {
-      dump_methods(&rd);
+      dump_methods(&rd, !no_headers);
     }
     if (clsdef || all) {
-      dump_clsdefs(&rd);
+      dump_clsdefs(&rd, !no_headers);
     }
     if (clsdata || all) {
-      dump_clsdata(&rd);
+      dump_clsdata(&rd, !no_headers);
     }
     if (code || all) {
       dump_code(&rd);
@@ -173,6 +195,12 @@ int main(int argc, char* argv[]) {
     }
     if (anno || all) {
       dump_anno(&rd);
+    }
+    if (debug || all) {
+      dump_debug(&rd);
+    }
+    if (ddebug_offset != 0) {
+      disassemble_debug(&rd, ddebug_offset);
     }
     fprintf(stdout, "\n");
     fflush(stdout);

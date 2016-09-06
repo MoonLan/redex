@@ -12,11 +12,10 @@
 #include <gtest/gtest.h>
 #include <string>
 
-#include <folly/json.h>
-#include <folly/dynamic.h>
+#include <json/json.h>
 
 #include "DexClass.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexLoader.h"
 #include "PassManager.h"
 #include "RedexContext.h"
@@ -29,15 +28,19 @@
 TEST(EmptyClassesTest1, emptyclasses) {
   g_redex = new RedexContext();
 
+  // Hardcoded path is for OSS automake test harness, environment variable is
+  // for Buck
   const char* dexfile = "empty-classes-test-class.dex";
   if (access(dexfile, R_OK) != 0) {
     dexfile = std::getenv("dexfile");
     ASSERT_NE(nullptr, dexfile);
   }
 
-  std::vector<DexClasses> dexen;
-  dexen.emplace_back(load_classes_from_dex(dexfile));
-  DexClasses& classes = dexen.back();
+  std::vector<DexStore> stores;
+  DexStore root_store("classes");
+  root_store.add_classes(load_classes_from_dex(dexfile));
+  DexClasses& classes = root_store.get_dexen().back();
+  stores.emplace_back(std::move(root_store));
   size_t before = classes.size();
   TRACE(EMPTY, 3, "Loaded classes: %ld\n", classes.size());
   // Report the classes that were loaded through tracing.
@@ -53,17 +56,24 @@ TEST(EmptyClassesTest1, emptyclasses) {
 
   std::vector<KeepRule> null_rules;
   auto const keep = { "Lcom/facebook/redextest/DoNotStrip;" };
+  Json::Value keep_annotations = Json::arrayValue;
+  for (const auto elt : keep) {
+    keep_annotations.append(Json::Value(elt));
+  }
+  Json::Value conf_obj;
+  conf_obj["keep_annotations"] = keep_annotations;
   PassManager manager(
     passes,
     null_rules,
-    folly::dynamic::object(
-      "keep_annotations", folly::dynamic(keep.begin(), keep.end()))
+    conf_obj
   );
-  manager.run_passes(dexen);
+  ConfigFiles dummy_cfg(conf_obj);
+  dummy_cfg.using_seeds = true;
+  manager.run_passes(stores, dummy_cfg);
 
   size_t after = 0;
   std::set<std::string> remaining_classes;
-  for (const auto& dex_classes : dexen) {
+  for (const auto& dex_classes : stores[0].get_dexen()) {
     for (const auto cls : dex_classes) {
       TRACE(EMPTY, 3, "Output class: %s\n",
           cls->get_type()->get_name()->c_str());
@@ -89,6 +99,7 @@ TEST(EmptyClassesTest1, emptyclasses) {
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/By2Or3;"));
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/MyBy2Or3;"));
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/WombatException;"));
+  ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/NumbatException;"));
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/Wombat;"));
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/EmptyButLaterExtended;"));
   ASSERT_EQ(1, remaining_classes.count("Lcom/facebook/redextest/Extender;"));

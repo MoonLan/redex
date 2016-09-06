@@ -24,7 +24,7 @@
 #include "Resolver.h"
 #include "SingleImplDefs.h"
 #include "Trace.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
 
@@ -75,9 +75,8 @@ void setup_method(DexMethod* orig_method, DexMethod* new_method) {
     }
   }
   new_method->make_concrete(
-      orig_method->get_access(), orig_method->get_code(),
+      orig_method->get_access(), std::move(orig_method->get_code()),
       orig_method->is_virtual());
-  orig_method->set_code(nullptr);
 }
 
 /**
@@ -175,25 +174,16 @@ void OptimizationImpl::rewrite_field_defs(DexType* intf, SingleImplData& data) {
         field->get_class(), field->get_name(), data.cls);
     assert(f != field);
     TRACE(INTF, 3, "(FDEF) %s\n", SHOW(field));
+    f->set_deobfuscated_name(field->get_deobfuscated_name());
+    f->rstate = field->rstate;
     auto field_anno = field->get_anno_set();
     if (field_anno) {
       f->attach_annotation_set(field_anno);
     }
     f->make_concrete(field->get_access(), field->get_static_value());
-    bool is_static = f->get_access() & DexAccessFlags::ACC_STATIC;
     auto cls = type_class(field->get_class());
-    auto& fields = is_static ? cls->get_sfields() : cls->get_ifields();
-    DEBUG_ONLY bool erase = false;
-    for (auto it = fields.begin(); it != fields.end(); it++) {
-      if (*it == field) {
-        erase = true;
-        it = fields.erase(it);
-        break;
-      }
-    }
-    assert(erase);
-    fields.push_back(f);
-    fields.sort(compare_dexfields);
+    cls->remove_field(field);
+    cls->add_field(f);
     TRACE(INTF, 3, "(FDEF)\t=> %s\n", SHOW(f));
   }
 }
@@ -207,6 +197,8 @@ void OptimizationImpl::rewrite_field_refs(DexType* intf, SingleImplData& data) {
     assert(!single_impls->is_escaped(field->get_class()));
     DexField* f = DexField::make_field(
         field->get_class(), field->get_name(), data.cls);
+    f->set_deobfuscated_name(field->get_deobfuscated_name());
+    f->rstate = field->rstate;
     for (const auto opcode : fieldrefs.second) {
       TRACE(INTF, 3, "(FREF) %s\n", SHOW(opcode));
       assert(f != opcode->field());
@@ -247,23 +239,14 @@ void OptimizationImpl::rewrite_method_defs(DexType* intf,
     assert(proto != meth->get_proto());
     auto new_meth = DexMethod::make_method(
         meth->get_class(), meth->get_name(), proto);
+    new_meth->set_deobfuscated_name(meth->get_deobfuscated_name());
+    new_meth->rstate = meth->rstate;
     assert(new_meth != meth);
     setup_method(meth, new_meth);
     new_methods[method] = new_meth;
     auto owner = type_class(new_meth->get_class());
-    auto& meths =
-        new_meth->is_virtual() ? owner->get_vmethods() : owner->get_dmethods();
-    DEBUG_ONLY bool erased = false;
-    for (auto m = meths.begin(); m != meths.end(); m++) {
-      if (*m == meth) {
-        erased = true;
-        meths.erase(m);
-        break;
-      }
-    }
-    assert(erased);
-    meths.push_back(new_meth);
-    meths.sort(compare_dexmethods);
+    owner->remove_method(meth);
+    owner->add_method(new_meth);
     TRACE(INTF, 3, "(MDEF)\t=> %s\n", SHOW(new_meth));
   }
 }
@@ -299,6 +282,8 @@ void OptimizationImpl::rewrite_method_refs(DexType* intf,
     auto proto = get_or_make_proto(intf, data.cls, new_meth->get_proto());
     new_meth = DexMethod::make_method(
             new_meth->get_class(), new_meth->get_name(), proto);
+    new_meth->set_deobfuscated_name(method->get_deobfuscated_name());
+    new_meth->rstate = method->rstate;
     new_methods[method] = new_meth;
     TRACE(INTF, 3, "(MREF)\t=> %s\n", SHOW(new_meth));
     for (auto opcode : mrefit.second) {
@@ -344,11 +329,12 @@ void OptimizationImpl::rewrite_interface_methods(DexType* intf,
     if (!new_meth) {
       new_meth = DexMethod::make_method(impl->get_type(), meth->get_name(),
           meth->get_proto());
+      new_meth->set_deobfuscated_name(meth->get_deobfuscated_name());
+      new_meth->rstate = meth->rstate;
       TRACE(INTF, 5, "(MITF) created impl method %s\n", SHOW(new_meth));
       setup_method(meth, new_meth);
       assert(new_meth->is_virtual());
-      impl->get_vmethods().push_back(new_meth);
-      impl->get_vmethods().sort(compare_dexmethods);
+      impl->add_method(new_meth);
       TRACE(INTF, 3, "(MITF) moved interface method %s\n", SHOW(new_meth));
     } else {
       TRACE(INTF, 3, "(MITF) found method impl %s\n", SHOW(new_meth));

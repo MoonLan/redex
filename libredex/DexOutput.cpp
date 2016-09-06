@@ -8,31 +8,32 @@
  */
 
 #include <algorithm>
+#include <memory>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <list>
 #include <stdlib.h>
 #include <unordered_set>
 #include <functional>
 #include <exception>
 #include <assert.h>
-#include <folly/Optional.h>
 
 #include "Debug.h"
 #include "DexClass.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
+#include "Pass.h"
+#include "Resolver.h"
 #include "Sha1.h"
 #include "Trace.h"
 #include "Transform.h"
-#include "walkers.h"
+#include "Walkers.h"
 #include "WorkQueue.h"
 
 /*
  * For adler32...
  */
 #include <zlib.h>
-
-using folly::Optional;
 
 typedef bool (*cmp_dstring)(const DexString*, const DexString*);
 typedef bool (*cmp_dtype)(const DexType*, const DexType*);
@@ -68,6 +69,8 @@ typedef bool (*cmp_dmethod)(const DexMethod*, const DexMethod*);
  * strings at the class level, but also gather strings for all types discovered
  * at the class level.
  */
+
+
 class GatheredTypes {
  private:
   std::vector<DexString*> m_lstring;
@@ -75,6 +78,9 @@ class GatheredTypes {
   std::vector<DexField*> m_lfield;
   std::vector<DexMethod*> m_lmethod;
   DexClasses* m_classes;
+  std::map<const DexString*, unsigned int> m_cls_load_strings;
+  std::map<const DexString*, unsigned int> m_cls_strings;
+  std::map<const DexMethod*, unsigned int> m_methods_in_cls_order;
 
   void gather_components();
   dexstring_to_idx* get_string_index(cmp_dstring cmp = compare_dexstrings);
@@ -83,21 +89,64 @@ class GatheredTypes {
   dexfield_to_idx* get_field_index(cmp_dfield cmp = compare_dexfields);
   dexmethod_to_idx* get_method_index(cmp_dmethod cmp = compare_dexmethods);
 
+  void build_cls_load_map();
+  void build_cls_map();
+  void build_method_map();
+
  public:
   GatheredTypes(DexClasses* classes);
   DexOutputIdx* get_dodx(const uint8_t* base);
   template <class T = decltype(compare_dexstrings)>
   std::vector<DexString*> get_dexstring_emitlist(T cmp = compare_dexstrings);
+  std::vector<DexString*> get_cls_order_dexstring_emitlist();
+  std::vector<DexString*> keep_cls_strings_together_emitlist();
   template <class T = decltype(compare_dexmethods)>
   std::vector<DexMethod*> get_dexmethod_emitlist(T cmp = compare_dexmethods);
+  std::vector<DexMethod*> get_cls_order_dexmethod_emitlist();
   void gather_class(int num);
 
   std::unordered_set<DexString*> index_type_names();
 };
 
+template<class T, class U>
+class CustomSort {
+  private:
+    std::map<const T*, unsigned int> m_map;
+    U m_cmp;
+
+  public:
+    CustomSort(std::map<const T*, unsigned int> input_map, U cmp) {
+      m_map = input_map;
+      m_cmp = cmp;
+    }
+
+    bool operator()(const T* a, const T* b) const {
+      bool a_in = m_map.count(a);
+      bool b_in = m_map.count(b);
+      if (!a_in && !b_in) {
+        return m_cmp(a,b);
+      } else if (a_in && b_in) {
+        return (m_map.at(a) < m_map.at(b));
+      } else if (a_in) {
+        return true;
+      } else {
+        return false;
+      }
+    }
+};
+
 GatheredTypes::GatheredTypes(DexClasses* classes)
   : m_classes(classes)
 {
+  // ensure that the string id table contains the empty string, which is used
+  // for the DexPosition mapping
+  m_lstring.push_back(DexString::make_string(""));
+
+  // build maps for the different custom sorting options
+  build_cls_load_map();
+  build_cls_map();
+  build_method_map();
+
   gather_components();
 }
 
@@ -112,8 +161,20 @@ std::unordered_set<DexString*> GatheredTypes::index_type_names() {
 template <class T>
 std::vector<DexString*> GatheredTypes::get_dexstring_emitlist(T cmp) {
   std::vector<DexString*> strlist(m_lstring);
-  std::sort(strlist.begin(), strlist.end(), cmp);
+  std::sort(strlist.begin(), strlist.end(), std::cref(cmp));
   return strlist;
+}
+
+std::vector<DexString*> GatheredTypes::get_cls_order_dexstring_emitlist() {
+  return get_dexstring_emitlist(CustomSort<DexString, cmp_dstring>(
+        m_cls_load_strings,
+        compare_dexstrings));
+}
+
+std::vector<DexString*> GatheredTypes::keep_cls_strings_together_emitlist() {
+  return get_dexstring_emitlist(CustomSort<DexString, cmp_dstring>(
+        m_cls_strings,
+        compare_dexstrings));
 }
 
 template <class T>
@@ -125,8 +186,14 @@ std::vector<DexMethod*> GatheredTypes::get_dexmethod_emitlist(T cmp) {
     methlist.insert(methlist.end(), dmethods.begin(), dmethods.end());
     methlist.insert(methlist.end(), vmethods.begin(), vmethods.end());
   }
-  std::sort(methlist.begin(), methlist.end(), cmp);
+  std::sort(methlist.begin(), methlist.end(), std::cref(cmp));
   return methlist;
+}
+
+std::vector<DexMethod*> GatheredTypes::get_cls_order_dexmethod_emitlist() {
+  return get_dexmethod_emitlist(CustomSort<DexMethod, cmp_dmethod>(
+        m_methods_in_cls_order,
+        compare_dexmethods));
 }
 
 DexOutputIdx* GatheredTypes::get_dodx(const uint8_t* base) {
@@ -204,6 +271,88 @@ dexproto_to_idx* GatheredTypes::get_proto_index(cmp_dproto cmp) {
   return sidx;
 }
 
+void GatheredTypes::build_cls_load_map() {
+  unsigned int index = 0;
+  int type_strings = 0;
+  int init_strings = 0;
+  int total_strings = 0;
+  for (const auto& cls : *m_classes) {
+    // gather type first, assuming class load will check all components of a class first
+    std::vector<DexType*> cls_types;
+    cls->gather_types(cls_types);
+    for (const auto& t : cls_types) {
+      if (!m_cls_load_strings.count(t->get_name())) {
+        m_cls_load_strings[t->get_name()] = index;
+        index++;
+        type_strings++;
+      }
+    }
+    // now add in any strings found in <clinit>
+    // since they are likely to be accessed during class load
+    for (const auto& m: cls->get_dmethods()) {
+      if (is_clinit(m)) {
+        std::vector<DexString*> method_strings;
+        m->gather_strings(method_strings);
+        for (const auto& s : method_strings) {
+          if (!m_cls_load_strings.count(s)) {
+            m_cls_load_strings[s] = index;
+            index++;
+            init_strings++;
+          }
+        }
+      }
+    }
+  }
+  total_strings += type_strings + init_strings;
+  for (const auto& cls : *m_classes) {
+    // now add all other strings in class order. This way we get some
+    // locality if a random class in a dex is loaded and then executes some methods
+    std::vector<const DexClass*> v;
+    v.push_back(cls);
+    walk_methods(v, [&](DexMethod* m) {
+      std::vector<DexString*> method_strings;
+      m->gather_strings(method_strings);
+      for (const auto& s : method_strings) {
+        if (!m_cls_load_strings.count(s)) {
+          m_cls_load_strings[s] = index;
+          index++;
+          total_strings++;
+        }
+      }
+    });
+  }
+  TRACE(CUSTOMSORT, 1, "found %d strings from types, %d from strings in init methods, %d total strings\n",
+      type_strings,
+      init_strings,
+      total_strings);
+}
+
+void GatheredTypes::build_cls_map() {
+  int index = 0;
+  for (const auto& cls : *m_classes) {
+      if (!m_cls_strings.count(cls->get_name())) {
+        m_cls_strings[cls->get_name()] = index++;
+      }
+  }
+}
+
+void GatheredTypes::build_method_map() {
+  auto index = 0;
+  for (const auto& cls : *m_classes) {
+    for (const auto& m : cls->get_dmethods()) {
+      if (!m_methods_in_cls_order.count(m)) {
+        m_methods_in_cls_order[m] = index;
+      }
+    }
+    for (const auto& m : cls->get_vmethods()) {
+      if (!m_methods_in_cls_order.count(m)) {
+        m_methods_in_cls_order[m] = index;
+      }
+    }
+    index++;
+  }
+}
+
 void GatheredTypes::gather_components() {
   // Gather references reachable from each class.
   for (auto const& cls : *m_classes) {
@@ -256,7 +405,8 @@ public:
   uint32_t m_offset;
   const char* m_filename;
   size_t m_dex_number;
-  const char* m_method_mapping_filename;
+  PositionMapper* m_pos_mapper;
+  std::string m_method_mapping_filename;
   std::map<DexTypeList*, uint32_t> m_tl_emit_offsets;
   std::vector<std::pair<DexCode*, dex_code_item*>> m_code_item_emits;
   std::map<DexClass*, uint32_t> m_cdi_offsets;
@@ -264,16 +414,17 @@ public:
   dex_header hdr;
   std::vector<dex_map_item> m_map_items;
   LocatorIndex* m_locator_index;
+  ConfigFiles& m_config_files;
 
   void insert_map_item(uint16_t typeidx, uint32_t size, uint32_t offset);
-  void generate_string_data();
+  void generate_string_data(SortMode mode = SortMode::DEFAULT);
   void generate_type_data();
   void generate_proto_data();
   void generate_field_data();
   void generate_method_data();
   void generate_class_data();
   void generate_class_data_items();
-  void generate_code_items();
+  void generate_code_items(SortMode mode = SortMode::DEFAULT);
   void generate_static_values();
   void unique_annotations(annomap_t& annomap,
                           std::vector<DexAnnotation*>& annolist);
@@ -295,7 +446,7 @@ public:
   void init_header_offsets();
   void align_output() { m_offset = (m_offset + 3) & ~3; }
   void emit_locator(Locator locator);
-  Optional<Locator> locator_for_descriptor(
+  std::unique_ptr<Locator> locator_for_descriptor(
     const std::unordered_set<DexString*>& type_names,
     DexString* descriptor);
 
@@ -305,9 +456,11 @@ public:
     DexClasses* classes,
     LocatorIndex* locator_index,
     size_t dex_number,
-    const char* method_mapping_path);
+    ConfigFiles& config_files,
+    PositionMapper* pos_mapper,
+    std::string method_mapping_path);
   ~DexOutput();
-  void prepare();
+  void prepare(SortMode string_mode, SortMode code_mode);
   void write();
 };
 
@@ -316,7 +469,11 @@ DexOutput::DexOutput(
   DexClasses* classes,
   LocatorIndex* locator_index,
   size_t dex_number,
-  const char* method_mapping_path) {
+  ConfigFiles& config_files,
+  PositionMapper* pos_mapper,
+  std::string method_mapping_path)
+    : m_config_files(config_files)
+{
   m_classes = classes;
   m_output = (uint8_t*)malloc(k_max_dex_size);
   memset(m_output, 0, k_max_dex_size);
@@ -324,6 +481,7 @@ DexOutput::DexOutput(
   m_gtypes = new GatheredTypes(classes);
   dodx = m_gtypes->get_dodx(m_output);
   m_filename = path;
+  m_pos_mapper = pos_mapper,
   m_method_mapping_filename = method_mapping_path;
   m_dex_number = dex_number;
   m_locator_index = locator_index;
@@ -350,13 +508,13 @@ void DexOutput::emit_locator(Locator locator) {
   char buf[Locator::encoded_max];
   locator.encode(buf);
   size_t locator_length = strlen(buf); // ASCII-only
-  write_uleb128(m_output + m_offset, locator_length);
-  m_offset += uleb128_encoding_size(locator_length);
+  write_uleb128(m_output + m_offset, (uint32_t) locator_length);
+  m_offset += uleb128_encoding_size((uint32_t) locator_length);
   memcpy(m_output + m_offset, buf, locator_length + 1);
   m_offset += locator_length + 1;
 }
 
-Optional<Locator>
+std::unique_ptr<Locator>
 DexOutput::locator_for_descriptor(
   const std::unordered_set<DexString*>& type_names,
   DexString* descriptor)
@@ -367,7 +525,7 @@ DexOutput::locator_for_descriptor(
     if (locator_it != locator_index->end()) {
       // This string is the name of a type we define in one of our
       // dex files.
-      return locator_it->second;
+      return std::unique_ptr<Locator>(new Locator(locator_it->second));
     }
 
     if (type_names.count(descriptor)) {
@@ -380,7 +538,7 @@ DexOutput::locator_for_descriptor(
         if (elementDescriptor != nullptr) {
           locator_it = locator_index->find(elementDescriptor);
           if (locator_it != locator_index->end()) {
-            return locator_it->second;
+            return std::unique_ptr<Locator>(new Locator(locator_it->second));
           }
         }
       }
@@ -388,14 +546,14 @@ DexOutput::locator_for_descriptor(
       // We have the name of a type, but it's not a type we define.
       // Emit the special locator that indicates we should look in the
       // system classloader.
-      return Locator::make(0, 0);
+      return std::unique_ptr<Locator>(new Locator(Locator::make(0, 0)));
     }
   }
 
-  return {};
+  return nullptr;
 }
 
-void DexOutput::generate_string_data() {
+void DexOutput::generate_string_data(SortMode mode) {
   /*
    * This is a index to position within the string data.  There
    * is no specific ordering specified here for the dex spec.
@@ -404,7 +562,17 @@ void DexOutput::generate_string_data() {
    * for strings that are used by the opcode const-string.  Whereas
    * this should be ordered by access for page-cache efficiency.
    */
-  std::vector<DexString*> string_order = m_gtypes->get_dexstring_emitlist();
+  std::vector<DexString*> string_order;
+  if (mode == CLASS_ORDER) {
+    TRACE(CUSTOMSORT, 1, "using class order for string pool sorting\n");
+    string_order = m_gtypes->get_cls_order_dexstring_emitlist();
+  } else if (mode == CLASS_STRINGS) {
+    TRACE(CUSTOMSORT, 1, "using class names pack for string pool sorting\n");
+    string_order = m_gtypes->keep_cls_strings_together_emitlist();
+  } else {
+    TRACE(CUSTOMSORT, 1, "using default string pool sorting\n");
+    string_order = m_gtypes->get_dexstring_emitlist();
+  }
   dex_string_id* stringids = (dex_string_id*)(m_output + hdr.string_ids_off);
 
   std::unordered_set<DexString*> type_names = m_gtypes->index_type_names();
@@ -419,10 +587,10 @@ void DexOutput::generate_string_data() {
     }
   }
 
-  insert_map_item(TYPE_STRING_DATA_ITEM, nrstr, m_offset);
+  insert_map_item(TYPE_STRING_DATA_ITEM, (uint32_t) nrstr, m_offset);
   for (DexString* str : string_order) {
     // Emit lookup acceleration string if requested
-    Optional<Locator> locator = locator_for_descriptor(type_names, str);
+    std::unique_ptr<Locator> locator = locator_for_descriptor(type_names, str);
     if (locator) {
       unsigned orig_offset = m_offset;
       emit_locator(*locator);
@@ -431,6 +599,7 @@ void DexOutput::generate_string_data() {
 
     // Emit the string itself
     uint32_t idx = dodx->stringidx(str);
+    TRACE(CUSTOMSORT, 3, "str emit %s\n", SHOW(str));
     stringids[idx].offset = m_offset;
     str->encode(m_output + m_offset);
     m_offset += str->get_entry_size();
@@ -478,7 +647,7 @@ void DexOutput::generate_typelist_data() {
     m_offset += size;
     m_stats.num_type_lists++;
   }
-  insert_map_item(TYPE_TYPE_LIST, num_tls, tl_start);
+  insert_map_item(TYPE_TYPE_LIST, (uint32_t) num_tls, tl_start);
 }
 
 void DexOutput::generate_proto_data() {
@@ -511,28 +680,65 @@ void DexOutput::generate_field_data() {
 namespace {
 
 void write_method_mapping(
-  const char* filename,
+  std::string filename,
   const DexOutputIdx* dodx,
+  const ProguardMap& proguard_map,
   size_t dex_number
 ) {
-  if (!filename || filename[0] == '\0') return;
-  FILE* fd = fopen(filename, "a");
-  if (!fd) {
-    fprintf(stderr, "Can't open method mapping file %s: %s\n",
-            filename,
-            strerror(errno));
-    return;
-  }
+  if (filename.empty()) return;
+  FILE* fd = fopen(filename.c_str(), "a");
+  assert_log(fd, "Can't open method mapping file %s: %s\n",
+             filename.c_str(),
+             strerror(errno));
   for (auto& it : dodx->method_to_idx()) {
     auto method = it.first;
     auto idx = it.second;
+
+    // Types (and methods) internal to our app have a cached deobfuscated name
+    // that comes from the proguard map.  If we don't have one, it's a
+    // system/framework class, so we can just return the name.
+    auto const& typecls = method->get_class();
+    auto const& cls = type_class(typecls);
+    auto deobf_class = [&] {
+      if (cls) {
+        auto deobname = cls->get_deobfuscated_name();
+        if (!deobname.empty()) return cls->get_deobfuscated_name();
+      }
+      return proguard_name(typecls);
+    }();
+
+    // Some method refs aren't "concrete" (e.g., referring to a method defined
+    // by a superclass via a subclass).  We only know how to deobfuscate
+    // concrete names, so resolve this ref to an actual definition.
+    auto resolved_method = [&] {
+      if (cls) {
+        auto intf_mr = resolve_intf_methodref(method);
+        if (intf_mr) return intf_mr;
+        auto resm = resolve_method(method, MethodSearch::Any);
+        if (resm) return resm;
+      }
+      return method;
+    }();
+
+    // Consult the cached method names, or just give it back verbatim.
+    auto deobf_method = [&] {
+      auto deobfname = resolved_method->get_deobfuscated_name();
+      if (!deobfname.empty()) return deobfname;
+      return proguard_name(resolved_method);
+    }();
+
+    // Format is <cls>.<name>(<args>)<ret>
+    // We only want the name here.
+    auto begin = deobf_method.find('.') + 1;
+    auto end = deobf_method.rfind('(');
+    auto deobf_method_name = deobf_method.substr(begin, end-begin);
 
     fprintf(fd,
             "%u %lu %s %s\n",
             idx,
             dex_number,
-            method->get_name()->c_str(),
-            method->get_class()->get_name()->c_str());
+            deobf_method_name.c_str(),
+            deobf_class.c_str());
   }
   fclose(fd);
 }
@@ -562,7 +768,12 @@ void DexOutput::generate_method_data() {
     if (method->is_concrete()) m_stats.num_methods++;
     m_stats.num_method_refs++;
   }
-  write_method_mapping(m_method_mapping_filename, dodx, m_dex_number);
+  write_method_mapping(
+    m_method_mapping_filename,
+    dodx,
+    m_config_files.get_proguard_map(),
+    m_dex_number
+  );
 }
 
 void DexOutput::generate_class_data() {
@@ -576,8 +787,9 @@ void DexOutput::generate_class_data() {
     cdefs[i].interfaces_off = 0;
     cdefs[i].annotations_off = 0;
     cdefs[i].interfaces_off = m_tl_emit_offsets[clz->get_interfaces()];
-    if (clz->get_source_file() != nullptr) {
-      cdefs[i].source_file_idx = dodx->stringidx(clz->get_source_file());
+    auto source_file = m_pos_mapper->get_source_file(clz);
+    if (source_file != nullptr) {
+      cdefs[i].source_file_idx = dodx->stringidx(source_file);
     } else {
       cdefs[i].source_file_idx = DEX_NO_INDEX;
     }
@@ -585,6 +797,13 @@ void DexOutput::generate_class_data() {
       cdefs[i].class_data_offset = m_cdi_offsets[clz];
     } else {
       cdefs[i].class_data_offset = 0;
+      always_assert_log(
+          clz->get_dmethods().size() == 0 &&
+          clz->get_vmethods().size() == 0 &&
+          clz->get_ifields().size() == 0 &&
+          clz->get_sfields().size() == 0,
+          "DexClass %s has member but no class data!\n",
+          SHOW(clz->get_type()));
     }
     if (m_static_values.count(clz)) {
       cdefs[i].static_values_off = m_static_values[clz];
@@ -602,7 +821,7 @@ void DexOutput::generate_class_data_items() {
   dexcode_to_offset dco;
   uint32_t cdi_start = m_offset;
   for (auto& it : m_code_item_emits) {
-    uint32_t offset = ((uint8_t*)it.second) - m_output;
+    uint32_t offset = (uint32_t) (((uint8_t*)it.second) - m_output);
     dco[it.first] = offset;
   }
   for (uint32_t i = 0; i < hdr.class_defs_size; i++) {
@@ -613,52 +832,70 @@ void DexOutput::generate_class_data_items() {
     m_cdi_offsets[clz] = m_offset;
     m_offset += size;
   }
-  insert_map_item(TYPE_CLASS_DATA_ITEM, m_cdi_offsets.size(), cdi_start);
+  insert_map_item(TYPE_CLASS_DATA_ITEM, (uint32_t) m_cdi_offsets.size(), cdi_start);
 }
 
-void DexOutput::generate_code_items() {
+void DexOutput::generate_code_items(SortMode mode) {
   /*
    * Optimization note:  We should pass a sort routine to the
    * emitlist to optimize pagecache efficiency.
    */
   align_output();
   uint32_t ci_start = m_offset;
-  std::vector<DexMethod*> lmeth = m_gtypes->get_dexmethod_emitlist();
+
+  std::vector<DexMethod*> lmeth;
+  if (mode == CLASS_ORDER) {
+    TRACE(CUSTOMSORT, 1, "using class order for bytecode sorting\n");
+    lmeth = m_gtypes->get_cls_order_dexmethod_emitlist();
+  } else {
+    TRACE(CUSTOMSORT, 1, "using default bytecode sorting\n");
+    lmeth = m_gtypes->get_dexmethod_emitlist();
+  }
   for (DexMethod* meth : lmeth) {
     if (meth->get_access() & (DEX_ACCESS_ABSTRACT | DEX_ACCESS_NATIVE)) {
       // There is no code item for ABSTRACT or NATIVE methods.
       continue;
     }
-    DexCode* code = meth->get_code();
+    TRACE(CUSTOMSORT, 3, "method emit %s %s\n", SHOW(meth->get_class()), SHOW(meth));
+    std::unique_ptr<DexCode>& code = meth->get_code();
     always_assert_log(
         meth->is_concrete() && code != nullptr,
         "Undefined method in generate_code_items()\n\t prototype: %s\n",
         show_short(meth).c_str());
     align_output();
     int size = code->encode(dodx, (uint32_t*)(m_output + m_offset));
-    m_code_item_emits.emplace_back(code, (dex_code_item*)(m_output + m_offset));
+    m_code_item_emits.emplace_back(code.get(),
+                                   (dex_code_item*)(m_output + m_offset));
     m_offset += size;
   }
-  insert_map_item(TYPE_CODE_ITEM, m_code_item_emits.size(), ci_start);
+  insert_map_item(TYPE_CODE_ITEM, (uint32_t) m_code_item_emits.size(), ci_start);
 }
 
 void DexOutput::generate_static_values() {
   uint32_t sv_start = m_offset;
+  std::unordered_map<DexEncodedValueArray,
+                     uint32_t,
+                     boost::hash<DexEncodedValueArray>>
+      enc_arrays;
   for (uint32_t i = 0; i < hdr.class_defs_size; i++) {
     DexClass* clz = m_classes->get(i);
-    DexEncodedValueArray* deva = clz->get_static_values();
-    if (deva == nullptr) continue;
-    m_static_values[clz] = m_offset;
-    uint8_t* output = m_output + m_offset;
-    uint8_t* outputsv = output;
-    /* No alignment requirements */
-    deva->encode(dodx, output);
-    m_offset += output - outputsv;
-    m_stats.num_static_values++;
-    delete deva;
+    std::unique_ptr<DexEncodedValueArray> deva(clz->get_static_values());
+    if (!deva) continue;
+    if (enc_arrays.count(*deva)) {
+      m_static_values[clz] = enc_arrays.at(*deva);
+    } else {
+      uint8_t* output = m_output + m_offset;
+      uint8_t* outputsv = output;
+      /* No alignment requirements */
+      deva->encode(dodx, output);
+      enc_arrays.emplace(std::move(*deva.release()), m_offset);
+      m_static_values[clz] = m_offset;
+      m_offset += output - outputsv;
+      m_stats.num_static_values++;
+    }
   }
   if (m_static_values.size()) {
-    insert_map_item(TYPE_ENCODED_ARRAY_ITEM, m_static_values.size(), sv_start);
+    insert_map_item(TYPE_ENCODED_ARRAY_ITEM, (uint32_t) enc_arrays.size(), sv_start);
   }
 }
 
@@ -732,7 +969,7 @@ void DexOutput::unique_xrefs(asetmap_t& asetmap,
   for (auto xref : xreflist) {
     if (xrefmap.count(xref)) continue;
     std::vector<uint32_t> xref_bytes;
-    xref_bytes.push_back(xref->size());
+    xref_bytes.push_back((unsigned int) xref->size());
     for (auto param : *xref) {
       DexAnnotationSet* das = param.second;
       always_assert_log(asetmap.count(das) != 0,
@@ -844,11 +1081,11 @@ void DexOutput::generate_debug_items() {
   for (auto& it : m_code_item_emits) {
     DexCode* dc = it.first;
     dex_code_item* dci = it.second;
-    DexDebugItem* dbg = dc->get_debug_item();
+    auto& dbg = dc->get_debug_item();
     if (dbg == nullptr) continue;
     dbgcount++;
     // No align requirement for debug items.
-    int size = dbg->encode(dodx, m_output + m_offset);
+    int size = dbg->encode(dodx, m_pos_mapper, m_output + m_offset);
     dci->debug_info_off = m_offset;
     m_offset += size;
   }
@@ -860,7 +1097,7 @@ void DexOutput::generate_map() {
   uint32_t* mapout = (uint32_t*)(m_output + m_offset);
   hdr.map_off = m_offset;
   insert_map_item(TYPE_MAP_LIST, 1, m_offset);
-  *mapout = m_map_items.size();
+  *mapout = (uint32_t) m_map_items.size();
   dex_map_item* map = (dex_map_item*)(mapout + 1);
   for (auto const& mit : m_map_items) {
     *map++ = mit;
@@ -875,7 +1112,7 @@ void DexOutput::generate_map() {
  * with the jumbo-ness of their stridx.
  */
 static void fix_method_jumbos(DexMethod* method, const DexOutputIdx* dodx) {
-  auto code = method->get_code();
+  auto& code = method->get_code();
   if (!code) return; // nothing to do for native methods
 
   auto& insts = code->get_instructions();
@@ -897,13 +1134,9 @@ static void fix_method_jumbos(DexMethod* method, const DexOutputIdx* dodx) {
   }
   if (jumbo_mismatches.empty()) return;
   MethodTransformer trans_method(method);
-  ;
   for (auto str_opcode : jumbo_mismatches) {
-    auto new_str_op = new DexOpcodeString(
-        str_opcode->jumbo() ? OPCODE_CONST_STRING : OPCODE_CONST_STRING_JUMBO,
-        str_opcode->get_string());
-    new_str_op->set_dest(str_opcode->dest());
-    trans_method->replace_opcode(str_opcode, new_str_op);
+    str_opcode->set_opcode(
+      str_opcode->jumbo() ? OPCODE_CONST_STRING : OPCODE_CONST_STRING_JUMBO);
   }
 }
 
@@ -919,34 +1152,34 @@ void DexOutput::init_header_offsets() {
   hdr.endian_tag = ENDIAN_CONSTANT;
   /* Link section was never used */
   hdr.link_size = hdr.link_off = 0;
-  hdr.string_ids_size = dodx->stringsize();
+  hdr.string_ids_size = (uint32_t) dodx->stringsize();
   hdr.string_ids_off = hdr.string_ids_size ? m_offset : 0;
-  insert_map_item(TYPE_STRING_ID_ITEM, dodx->stringsize(), m_offset);
+  insert_map_item(TYPE_STRING_ID_ITEM, (uint32_t) dodx->stringsize(), m_offset);
 
   m_offset += dodx->stringsize() * sizeof(dex_string_id);
-  hdr.type_ids_size = dodx->typesize();
+  hdr.type_ids_size = (uint32_t) dodx->typesize();
   hdr.type_ids_off = hdr.type_ids_size ? m_offset : 0;
-  insert_map_item(TYPE_TYPE_ID_ITEM, dodx->typesize(), m_offset);
+  insert_map_item(TYPE_TYPE_ID_ITEM, (uint32_t) dodx->typesize(), m_offset);
 
   m_offset += dodx->typesize() * sizeof(dex_type_id);
-  hdr.proto_ids_size = dodx->protosize();
+  hdr.proto_ids_size = (uint32_t) dodx->protosize();
   hdr.proto_ids_off = hdr.proto_ids_size ? m_offset : 0;
-  insert_map_item(TYPE_PROTO_ID_ITEM, dodx->protosize(), m_offset);
+  insert_map_item(TYPE_PROTO_ID_ITEM, (uint32_t) dodx->protosize(), m_offset);
 
   m_offset += dodx->protosize() * sizeof(dex_proto_id);
-  hdr.field_ids_size = dodx->fieldsize();
+  hdr.field_ids_size = (uint32_t) dodx->fieldsize();
   hdr.field_ids_off = hdr.field_ids_size ? m_offset : 0;
-  insert_map_item(TYPE_FIELD_ID_ITEM, dodx->fieldsize(), m_offset);
+  insert_map_item(TYPE_FIELD_ID_ITEM, (uint32_t) dodx->fieldsize(), m_offset);
 
   m_offset += dodx->fieldsize() * sizeof(dex_field_id);
-  hdr.method_ids_size = dodx->methodsize();
+  hdr.method_ids_size = (uint32_t) dodx->methodsize();
   hdr.method_ids_off = hdr.method_ids_size ? m_offset : 0;
-  insert_map_item(TYPE_METHOD_ID_ITEM, dodx->methodsize(), m_offset);
+  insert_map_item(TYPE_METHOD_ID_ITEM, (uint32_t) dodx->methodsize(), m_offset);
 
   m_offset += dodx->methodsize() * sizeof(dex_method_id);
-  hdr.class_defs_size = m_classes->size();
+  hdr.class_defs_size = (uint32_t) m_classes->size();
   hdr.class_defs_off = hdr.class_defs_size ? m_offset : 0;
-  insert_map_item(TYPE_CLASS_DEF_ITEM, m_classes->size(), m_offset);
+  insert_map_item(TYPE_CLASS_DEF_ITEM, (uint32_t) m_classes->size(), m_offset);
 
   m_offset += m_classes->size() * sizeof(dex_class_def);
   hdr.data_off = m_offset;
@@ -967,20 +1200,20 @@ void DexOutput::finalize_header() {
   sha1_update(&context, m_output + skip, hdr.file_size - skip);
   sha1_final(hdr.signature, &context);
   memcpy(m_output, &hdr, sizeof(hdr));
-  uint32_t adler = adler32(0L, Z_NULL, 0);
+  uint32_t adler = (uint32_t)adler32(0L, Z_NULL, 0);
   skip = sizeof(hdr.magic) + sizeof(hdr.checksum);
-  adler = adler32(adler, (const Bytef*)(m_output + skip), hdr.file_size - skip);
+  adler = (uint32_t) adler32(adler, (const Bytef*)(m_output + skip), hdr.file_size - skip);
   hdr.checksum = adler;
   memcpy(m_output, &hdr, sizeof(hdr));
 }
 
-void DexOutput::prepare() {
+void DexOutput::prepare(SortMode string_mode, SortMode code_mode) {
   fix_jumbos(m_classes, dodx);
   init_header_offsets();
   generate_static_values();
   generate_typelist_data();
-  generate_string_data();
-  generate_code_items();
+  generate_string_data(string_mode);
+  generate_code_items(code_mode);
   generate_class_data_items();
   generate_type_data();
   generate_proto_data();
@@ -995,12 +1228,16 @@ void DexOutput::prepare() {
 }
 
 void DexOutput::write() {
+  struct stat st;
   int fd = open(m_filename, O_CREAT | O_TRUNC | O_WRONLY, 0660);
   if (fd == -1) {
     perror("Error writing dex");
     return;
   }
   ::write(fd, m_output, m_offset);
+  if (0 == fstat(fd, &st)) {
+    m_stats.num_bytes = st.st_size;
+  }
   close(fd);
 }
 
@@ -1010,15 +1247,32 @@ write_classes_to_dex(
   DexClasses* classes,
   LocatorIndex* locator_index,
   size_t dex_number,
-  const char* method_mapping_filename)
+  ConfigFiles& cfg,
+  const Json::Value& json_cfg,
+  PositionMapper* pos_mapper)
 {
+  auto method_mapping_filename = json_cfg.get("method_mapping", "").asString();
+  auto sort_strings = json_cfg.get("string_sort_mode", "").asString();
+  auto sort_bytecode = json_cfg.get("bytecode_sort_mode", "").asString();
+  SortMode string_sort_mode = DEFAULT;
+  SortMode code_sort_mode = DEFAULT;
+  if (sort_strings == "class_strings") {
+    string_sort_mode = CLASS_STRINGS;
+  } else if (sort_strings == "class_order") {
+    string_sort_mode = CLASS_ORDER;
+  }
+  if (sort_bytecode == "class_order") {
+    code_sort_mode = CLASS_ORDER;
+  }
   DexOutput dout = DexOutput(
     filename.c_str(),
     classes,
     locator_index,
     dex_number,
+    cfg,
+    pos_mapper,
     method_mapping_filename);
-  dout.prepare();
+  dout.prepare(string_sort_mode, code_sort_mode);
   dout.write();
   return dout.m_stats;
 }
@@ -1062,5 +1316,6 @@ dex_output_stats_t&
   lhs.num_static_values += rhs.num_static_values;
   lhs.num_annotations += rhs.num_annotations;
   lhs.num_type_lists += rhs.num_type_lists;
+  lhs.num_bytes += rhs.num_bytes;
   return lhs;
 }

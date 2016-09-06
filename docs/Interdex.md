@@ -29,7 +29,7 @@ Note that it is very important that you have compiled the app that you're going
 to be generating the heap dump with the same settings that you use in your
 release build, otherwise the class ordering will not reflect reality.
 
-It is equally important that the usage reflects a real-world scenario.Using
+It is equally important that the usage reflects a real-world scenario. Using
 an overly simplistic test or startup scenario will not generate representative
 data and will not lead to performance improvements. 
 
@@ -71,6 +71,17 @@ To enable the Interdex pass for you application, add the following to your confi
 
 - add "InterDexPass" to passes
 - add "coldstart\_classes": "list\_of\_classes.txt" to the config file
+
+## Options
+
+There are two flags that can be set to influence the behavior of the Interdex pass
+
+- emit_canaries: This flag controls whether each secondary dex has
+  a non-functional canary class added. Defaults to false.
+  Enable this only if you explicitly know that you need it.
+
+- static_prune: This flag controls whether Interdex attempts to remove classes
+  that have no references to them from the rest of the set of classes in the pgo list.
 
 # Measuring benefit
 

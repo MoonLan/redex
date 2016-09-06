@@ -36,6 +36,7 @@ T_NEWLINE \n
 T_COMMA ","
 T_SEMICOLON ";"
 T_AT "@"
+T_QUOTE "'"
 T_CLASS "class"
 T_INTERFACE "interface"
 T_AT_INTERFACE "@interface"
@@ -68,6 +69,7 @@ T_ALLOWACCESSMODIFICATION "-allowaccessmodification"
 T_APPLYMAPPING "-applymapping"
 T_ASSUMENOSIDEEFFECTS "-assumenosideeffects"
 T_CLASSOBFUSCATIONDICTIONARY "-classobfuscationdictionary"
+T_DONTNOTE "-dontnote"
 T_DONTOBFUSCATE "-dontobfuscate"
 T_DONTOPTIMIZE "-dontoptimize"
 T_DONTPREVERIFY "-dontpreverify"
@@ -76,6 +78,7 @@ T_DONTWARN "-dontwarn"
 T_DONTUSEMIXEDCASECLASSNAMES "-dontusemixedcaseclassnames"
 T_DONTSKIPNONPUBLICLIBRARYCLASSES "-dontskipnonpubliclibraryclasses"
 T_FLATTENPACKAGEHIERARCHY "-flattenpackagehierarchy"
+T_INCLUDE "-include"
 T_INJARS "-injars"
 T_OUTJARS "-outjars"
 T_KEEPATTRIBUTES "-keepattributes"
@@ -124,6 +127,7 @@ T_PATTERN [A-Za-z*[.0-9/$_]+[A-Za-z*\[\].0-9/$_#-]*
 {T_COMMA}                        {DEBUG("comma            ");  return T_COMMA;}
 {T_SEMICOLON}                    {DEBUG("semicolon        ");  return T_SEMICOLON;}
 {T_NOT}                          {DEBUG("not              ");  return T_NOT;}
+{T_QUOTE}                        {DEBUG("quote            ");  return T_QUOTE;}
 
 \*/;                             {DEBUG("any_member       ");  /* Can't use {ANY_MEMBER} at start of line due to bug in flex */ return T_ANY_MEMBER;}
 
@@ -180,6 +184,7 @@ T_PATTERN [A-Za-z*[.0-9/$_]+[A-Za-z*\[\].0-9/$_#-]*
 {T_APPLYMAPPING}                 {DEBUG("[ignored rule]   "); return T_APPLYMAPPING;}
 {T_ASSUMENOSIDEEFFECTS}          {DEBUG("[ignored rule]   "); return T_ASSUMENOSIDEEFFECTS;}
 {T_CLASSOBFUSCATIONDICTIONARY}   {DEBUG("[ignored rule]   "); return T_CLASSOBFUSCATIONDICTIONARY;}
+{T_DONTNOTE}                     {DEBUG("[ignored rule]   "); return T_DONTNOTE;}
 {T_DONTOBFUSCATE}                {DEBUG("[ignored rule]   "); return T_DONTOBFUSCATE;}
 {T_DONTOPTIMIZE}                 {DEBUG("[ignored rule]   "); return T_DONTOPTIMIZE;}
 {T_DONTPREVERIFY}                {DEBUG("[ignored rule]   "); return T_DONTPREVERIFY;}
@@ -188,6 +193,7 @@ T_PATTERN [A-Za-z*[.0-9/$_]+[A-Za-z*\[\].0-9/$_#-]*
 {T_DONTUSEMIXEDCASECLASSNAMES}   {DEBUG("[ignored rule]   "); return T_DONTUSEMIXEDCASECLASSNAMES;}
 {T_DONTSKIPNONPUBLICLIBRARYCLASSES} {DEBUG("[ignored rule]   "); return T_DONTSKIPNONPUBLICLIBRARYCLASSES;}
 {T_FLATTENPACKAGEHIERARCHY}      {DEBUG("[ignored rule]   "); return T_FLATTENPACKAGEHIERARCHY;}
+{T_INCLUDE}                      {DEBUG("[ignored rule]   "); return T_INCLUDE;}
 {T_KEEPATTRIBUTES}               {DEBUG("[ignored rule]   "); return T_KEEPATTRIBUTES;}
 {T_KEEPPACKAGENAMES}             {DEBUG("[ignored rule]   "); return T_KEEPPACKAGENAMES;}
 {T_KEEPPARAMETERNAMES}           {DEBUG("[ignored rule]   "); return T_KEEPPARAMETERNAMES;}

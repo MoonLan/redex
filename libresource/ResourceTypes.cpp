@@ -519,7 +519,7 @@ status_t ResStringPool::setTo(const void* data, size_t size, bool copyData)
             (((const uint8_t*)data) + mHeader->stringsStart);
 
         if (mHeader->styleCount == 0) {
-            mStringPoolSize = (mSize - mHeader->stringsStart) / charSize;
+            mStringPoolSize = (uint32_t) ((mSize - mHeader->stringsStart) / charSize);
         } else {
             // check invariant: styles starts before end of data
             if (mHeader->stylesStart >= (mSize - sizeof(uint16_t))) {
@@ -3290,7 +3290,7 @@ ssize_t ResTable::Theme::getAttribute(uint32_t resID, Res_value* outValue,
             }
             if (pi != NULL) {
                 if (kDebugTableTheme) {
-                    ALOGI("Desired type index is %zd in avail %zu", t, Res_MAXTYPE + 1);
+                    ALOGI("Desired type index is %u in avail %zu", t, Res_MAXTYPE + 1);
                 }
                 if (t <= Res_MAXTYPE) {
                     const type_info& ti = pi->types[t];

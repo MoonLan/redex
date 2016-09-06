@@ -9,6 +9,7 @@
 
 #include "RedexContext.h"
 
+#include <mutex>
 #include <unordered_set>
 
 #include "Debug.h"
@@ -59,7 +60,7 @@ RedexContext::~RedexContext() {
   }
 }
 
-DexString* RedexContext::make_string(const char* nstr, int utfsize) {
+DexString* RedexContext::make_string(const char* nstr, uint32_t utfsize) {
   always_assert(nstr != nullptr);
   DexString* rv;
   pthread_mutex_lock(&s_string_lock);
@@ -74,7 +75,7 @@ DexString* RedexContext::make_string(const char* nstr, int utfsize) {
   return rv;
 }
 
-DexString* RedexContext::get_string(const char* nstr, int utfsize) {
+DexString* RedexContext::get_string(const char* nstr, uint32_t utfsize) {
   if (nstr == nullptr) {
     return nullptr;
   }
@@ -251,18 +252,58 @@ DexMethod* RedexContext::get_method(DexType* type,
   return rv;
 }
 
-void RedexContext::mutate_method_class(DexMethod* method, DexType* cls) {
+void RedexContext::erase_method(DexMethod* meth) {
   pthread_mutex_lock(&s_method_lock);
-  s_method_map[method->m_class][method->m_name].erase(method->m_proto);
-  method->m_class = cls;
-  s_method_map[method->m_class][method->m_name][method->m_proto] = method;
+  s_method_map[meth->get_class()][meth->get_name()].erase(meth->get_proto());
+  delete meth;
+  pthread_mutex_unlock(&s_method_lock);
+  return;
+}
+
+void RedexContext::mutate_method(DexMethod* method,
+                                 const DexMethodRef& ref,
+                                 bool rename_on_collision /* = false */) {
+  pthread_mutex_lock(&s_method_lock);
+  s_method_map[method->m_ref.cls][method->m_ref.name].erase(
+      method->m_ref.proto);
+
+  DexMethodRef r;
+  r.cls = ref.cls != nullptr ? ref.cls : method->m_ref.cls;
+  r.name = ref.name != nullptr ? ref.name : method->m_ref.name;
+  r.proto = ref.proto != nullptr ? ref.proto : method->m_ref.proto;
+  if (s_method_map[r.cls][r.name][r.proto] && rename_on_collision) {
+    std::string original_name(r.name->c_str());
+    for (uint16_t i = 0; i < 1000; ++i) {
+      r.name = DexString::make_string(
+          (original_name + "$redex" + std::to_string(i)).c_str());
+      if (!s_method_map[r.cls][r.name][r.proto]) {
+        break;
+      }
+    }
+  }
+  always_assert_log(!s_method_map[r.cls][r.name][r.proto],
+                    "Another method of the same signature already exists");
+  method->m_ref = r;
+  s_method_map[r.cls][r.name][r.proto] = method;
   pthread_mutex_unlock(&s_method_lock);
 }
 
-void RedexContext::mutate_method_proto(DexMethod* method, DexProto* proto) {
-  pthread_mutex_lock(&s_method_lock);
-  s_method_map[method->m_class][method->m_name].erase(method->m_proto);
-  method->m_proto = proto;
-  s_method_map[method->m_class][method->m_name][method->m_proto] = method;
-  pthread_mutex_unlock(&s_method_lock);
+void RedexContext::build_type_system(DexClass* cls) {
+  std::lock_guard<std::mutex> l(m_type_system_mutex);
+  const DexType* type = cls->get_type();
+  m_type_to_class.emplace(type, cls);
+  const auto& super = cls->get_super_class();
+  if (super) m_class_hierarchy[super].push_back(type);
+}
+
+DexClass* RedexContext::type_class(const DexType* t) {
+  auto it = m_type_to_class.find(t);
+  return it != m_type_to_class.end() ? it->second : nullptr;
+}
+
+const std::vector<const DexType*>& RedexContext::get_children(
+  const DexType* type
+) {
+  const auto& it = m_class_hierarchy.find(type);
+  return it != m_class_hierarchy.end() ? it->second : m_empty_types;
 }

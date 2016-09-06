@@ -14,8 +14,8 @@ inline bool match(const DexString* name,
 DexMethod* check_vmethods(const DexString* name,
                           const DexProto* proto,
                           const DexType* type) {
-  const auto cls = type_class(type);
-  for (auto& method : cls->get_vmethods()) {
+  const DexClass* cls = type_class(type);
+  for (const auto& method : cls->get_vmethods()) {
     if (match(name, proto, method)) return method;
   }
   return nullptr;
@@ -24,8 +24,8 @@ DexMethod* check_vmethods(const DexString* name,
 DexMethod* check_dmethods(const DexString* name,
                           const DexProto* proto,
                           const DexType* type) {
-  const auto cls = type_class(type);
-  for (auto& method : cls->get_dmethods()) {
+  const DexClass* cls = type_class(type);
+  for (const auto& method : cls->get_dmethods()) {
     if (match(name, proto, method)) return method;
   }
   return nullptr;
@@ -34,7 +34,6 @@ DexMethod* check_dmethods(const DexString* name,
 DexMethod* resolve_intf_methodref(DexType* intf, DexMethod* meth) {
 
   auto find_method = [&](const DexClass* cls) -> DexMethod* {
-    always_assert(cls->get_access() & ACC_INTERFACE);
     const auto& vmethods = cls->get_vmethods();
     for (const auto vmethod : vmethods) {
       if (vmethod->get_name() == meth->get_name() &&
@@ -45,7 +44,7 @@ DexMethod* resolve_intf_methodref(DexType* intf, DexMethod* meth) {
     return nullptr;
   };
 
-  const auto intf_cls = type_class(intf);
+  const DexClass* intf_cls = type_class(intf);
   if (intf_cls == nullptr) return nullptr;
   auto method = find_method(intf_cls);
   if (method) return method;
@@ -147,7 +146,7 @@ DexField* resolve_field(
         return a->get_name() == name && a->get_type() == type;
       };
 
-  auto cls = type_class_internal(owner);
+  const DexClass* cls = type_class(owner);
   while (cls) {
     if (fs == FieldSearch::Instance || fs == FieldSearch::Any) {
       for (auto ifield : cls->get_ifields()) {
@@ -163,8 +162,7 @@ DexField* resolve_field(
         }
       }
     }
-    cls = type_class_internal(cls->get_super_class());
+    cls = type_class(cls->get_super_class());
   }
   return nullptr;
 }
-

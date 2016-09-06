@@ -2,8 +2,8 @@ AM_CXXFLAGS = --std=gnu++11
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/test/gtest-1.7.0/include \
 	-I$(top_srcdir)/configparser \
-	-I$(top_srcdir)/include \
 	-I$(top_srcdir)/liblocator \
+	-I$(top_srcdir)/libredex \
 	-I$(top_srcdir)/libresource \
 	-I$(top_srcdir)/libresource/android \
 	-I$(top_srcdir)/libresource/androidfw \
@@ -15,6 +15,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/opt/annoclasskill \
 	-I$(top_srcdir)/opt/annokill \
 	-I$(top_srcdir)/opt/bridge \
+	-I$(top_srcdir)/opt/constant_propagation \
 	-I$(top_srcdir)/opt/delinit \
 	-I$(top_srcdir)/opt/delsuper \
 	-I$(top_srcdir)/opt/final_inline \
@@ -32,8 +33,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/opt/synth \
 	-I$(top_srcdir)/opt/unterface \
 	-I$(top_srcdir)/tools/redex-all \
-	-I$(top_srcdir)/third-party/folly \
-	-I$(top_srcdir)/util
+	-I$(top_srcdir)/util \
+	-I/usr/include/jsoncpp
 
 TESTS = \
 	config_parser_test \

@@ -17,17 +17,17 @@
 #include <boost/dynamic_bitset.hpp>
 
 #include "DexClass.h"
-#include "DexOpcode.h"
+#include "DexInstruction.h"
 #include "DexUtil.h"
 #include "Transform.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
 /*
  * These instructions have observable side effects so must always be considered
  * live, regardless of whether their output is consumed by another instruction.
  */
-static bool has_side_effects(DexCodeItemOpcode opc) {
+static bool has_side_effects(DexOpcode opc) {
   switch (opc) {
   case OPCODE_RETURN_VOID:
   case OPCODE_RETURN:
@@ -127,6 +127,7 @@ class LocalDce {
  private:
   const Scope& m_scope;
   size_t m_instructions_eliminated{0};
+  size_t m_total_instructions{0};
 
   /*
    * Eliminate dead code using a standard backward dataflow analysis for
@@ -162,7 +163,7 @@ class LocalDce {
     std::vector<boost::dynamic_bitset<>> liveness(
         cfg.size(), boost::dynamic_bitset<>(regs + 1));
     bool changed;
-    std::vector<DexOpcode*> dead_instructions;
+    std::vector<DexInstruction*> dead_instructions;
 
     TRACE(DCE, 5, "%s\n", show(method).c_str());
     TRACE(DCE, 5, "%s", show(cfg).c_str());
@@ -179,6 +180,9 @@ class LocalDce {
 
         // Compute live-out for this block from its successors.
         for (auto& s : b->succs()) {
+          if(s->id() == b->id()) {
+            bliveness |= prev_liveness;
+          }
           TRACE(DCE,
                 5,
                 "  S%lu: %s\n",
@@ -190,19 +194,20 @@ class LocalDce {
         // Compute live-in for this block by walking its instruction list in
         // reverse and applying the liveness rules.
         for (auto it = b->rbegin(); it != b->rend(); ++it) {
+          m_total_instructions++;
           if (it->type != MFLOW_OPCODE) {
             continue;
           }
-          bool required = is_required(it->op, bliveness);
+          bool required = is_required(it->insn, bliveness);
           if (required) {
-            update_liveness(it->op, bliveness);
+            update_liveness(it->insn, bliveness);
           } else {
-            dead_instructions.push_back(it->op);
+            dead_instructions.push_back(it->insn);
           }
           TRACE(CFG,
                 5,
                 "%s\n%s\n",
-                show(it->op).c_str(),
+                show(it->insn).c_str(),
                 show(bliveness).c_str());
         }
         if (bliveness != prev_liveness) {
@@ -244,14 +249,15 @@ class LocalDce {
     if (first->type == MFLOW_FALLTHROUGH) {
       return false;
     }
-    auto last = b->rbegin();
-    if (last->type == MFLOW_OPCODE &&
-        last->op->opcode() == FOPCODE_FILLED_ARRAY) {
-      return false;
+    for (auto last = b->rbegin(); last != b->rend(); ++last) {
+      if (last->type == MFLOW_OPCODE &&
+          last->insn->opcode() == FOPCODE_FILLED_ARRAY) {
+        return false;
+      }
     }
     // Skip if it contains nothing but debug info.
     for (; first != b->end(); ++first) {
-      if (first->type != MFLOW_DEBUG) {
+      if (first->type != MFLOW_DEBUG || first->type != MFLOW_POSITION) {
         return true;
       }
     }
@@ -263,29 +269,31 @@ class LocalDce {
       return;
     }
     // Gather the ops to delete.
-    std::unordered_set<DexOpcode*> delete_ops;
-    std::unordered_set<DexTryItem*> delete_tries;
+    std::unordered_set<DexInstruction*> delete_ops;
+    std::unordered_set<MethodItemEntry*> delete_catches;
     for (auto& mei : *b) {
       if (mei.type == MFLOW_OPCODE) {
-        delete_ops.insert(mei.op);
+        delete_ops.insert(mei.insn);
       } else if (mei.type == MFLOW_TRY) {
-        delete_tries.insert(mei.tentry->tentry);
+        delete_catches.insert(mei.tentry->catch_start);
+      } else if (mei.type == MFLOW_CATCH) {
+        delete_catches.insert(&mei);
       }
     }
     // Remove branch targets.
     for (auto it = transform->begin(); it != transform->end(); ++it) {
-      if (it->type == MFLOW_TARGET && delete_ops.count(it->target->src->op)) {
+      if (it->type == MFLOW_TARGET && delete_ops.count(it->target->src->insn)) {
         delete it->target;
         it->type = MFLOW_FALLTHROUGH;
       } else if (it->type == MFLOW_TRY &&
-                 delete_tries.count(it->tentry->tentry)) {
+                 delete_catches.count(it->tentry->catch_start)) {
         delete it->tentry;
         it->type = MFLOW_FALLTHROUGH;
+      } else if (it->type == MFLOW_CATCH &&
+                 delete_catches.count(&*it)) {
+        delete it->centry;
+        it->type = MFLOW_FALLTHROUGH;
       }
-    }
-    // Delete removed try items
-    for (auto tentry : delete_tries) {
-      delete tentry;
     }
     // Remove the instructions.
     for (auto& op : delete_ops) {
@@ -344,7 +352,7 @@ class LocalDce {
    * An instruction is required (i.e., live) if it has side effects or if its
    * destination register is live.
    */
-  bool is_required(DexOpcode* inst, const boost::dynamic_bitset<>& bliveness) {
+  bool is_required(DexInstruction* inst, const boost::dynamic_bitset<>& bliveness) {
     if (has_side_effects(inst->opcode())) {
       if (is_invoke(inst->opcode())) {
         auto invoke = static_cast<DexOpcodeMethod*>(inst);
@@ -367,7 +375,7 @@ class LocalDce {
   /*
    * Update the liveness vector given that `inst` is live.
    */
-  void update_liveness(const DexOpcode* inst,
+  void update_liveness(const DexInstruction* inst,
                        boost::dynamic_bitset<>& bliveness) {
     // The destination register is killed, so it isn't live before this.
     if (inst->dests_size()) {
@@ -380,11 +388,11 @@ class LocalDce {
     }
     // Source registers are live.
     for (size_t i = 0; i < inst->srcs_size(); i++) {
-      bliveness.set(inst->src(i));
+      bliveness.set(inst->src((int)i));
     }
     // `invoke-range` instructions need special handling since their sources
     // are encoded as a range.
-    if (inst->has_range_base()) {
+    if (inst->has_range()) {
       for (size_t i = 0; i < inst->range_size(); i++) {
         bliveness.set(inst->range_base() + i);
       }
@@ -400,6 +408,7 @@ class LocalDce {
   LocalDce(const Scope& scope) : m_scope(scope) {}
 
   void run() {
+	  TRACE(DCE, 1, "Running LocalDCE pass\n");
     walk_methods(m_scope,
                  [&](DexMethod* m) {
                    if (!m->get_code()) {
@@ -410,13 +419,17 @@ class LocalDce {
     TRACE(DCE, 1,
             "Dead instructions eliminated: %lu\n",
             m_instructions_eliminated);
+    TRACE(DCE, 1,
+            "Total instructions: %lu\n",
+            m_total_instructions);
+    TRACE(DCE, 1,
+            "Percentage of instructions identified as dead code: %f%%\n",
+            m_instructions_eliminated * 100 / double(m_total_instructions));
   }
 };
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
-void LocalDcePass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-  auto scope = build_class_scope(dexen);
+void LocalDcePass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  auto scope = build_class_scope(stores);
   LocalDce(scope).run();
 }

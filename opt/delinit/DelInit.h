@@ -15,5 +15,11 @@ class DelInitPass : public Pass {
  public:
   DelInitPass() : Pass("DelInitPass") {}
 
-  virtual void run_pass(DexClassesVector&, ConfigFiles&) override;
+  virtual void configure_pass(const PassConfig& pc) override {
+    pc.get("package_white_list", {}, m_package_filter);
+  }
+  virtual void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+
+ private:
+  std::vector<std::string> m_package_filter;
 };

@@ -287,7 +287,7 @@ void DexEncodedValueArray::encode(DexOutputIdx* dodx, uint8_t*& encdata) {
     uint8_t devtb = DEVT_HDR_TYPE(m_evtype);
     *encdata++ = devtb;
   }
-  encdata = write_uleb128(encdata, m_evalues->size());
+  encdata = write_uleb128(encdata, (uint32_t)m_evalues->size());
   for (auto const& ev : *m_evalues) {
     ev->encode(dodx, encdata);
   }
@@ -298,7 +298,7 @@ void DexEncodedValueAnnotation::encode(DexOutputIdx* dodx, uint8_t*& encdata) {
   uint32_t tidx = dodx->typeidx(m_type);
   *encdata++ = devtb;
   encdata = write_uleb128(encdata, tidx);
-  encdata = write_uleb128(encdata, m_annotations->size());
+  encdata = write_uleb128(encdata, (uint32_t)m_annotations->size());
   for (auto const& dae : *m_annotations) {
     DexString* str = dae.string;
     DexEncodedValue* dev = dae.encoded_value;
@@ -460,34 +460,27 @@ DexAnnotationSet* DexAnnotationSet::get_annotation_set(DexIdx* idx,
 
 void DexAnnotationDirectory::calc_internals() {
   int cntviz = 0;
-  if (m_class) {
-    int ca, cv;
-    m_class->viz_counts(ca, cv);
-    m_aset_size += 4 + 4 * (ca);
-    m_aset_count++;
-    m_anno_count += ca;
-    cntviz += cv;
-  }
-  if (m_field) {
-    for (auto const& p : *m_field) {
-      DexAnnotationSet* das = p.second;
-      int ca, cv;
+  auto updateCount = [this](DexAnnotationSet* das) {
+      unsigned long ca, cv;
       das->viz_counts(ca, cv);
       m_anno_count += ca;
       m_aset_size += 4 + 4 * (ca);
       m_aset_count++;
-      cntviz += cv;
+      return cv;
+  };
+  if (m_class) {
+    cntviz += updateCount(m_class);
+  }
+  if (m_field) {
+    for (auto const& p : *m_field) {
+      DexAnnotationSet* das = p.second;
+      cntviz += updateCount(das);
     }
   }
   if (m_method) {
     for (auto const& p : *m_method) {
       DexAnnotationSet* das = p.second;
-      int ca, cv;
-      das->viz_counts(ca, cv);
-      m_anno_count += ca;
-      m_aset_size += 4 + 4 * (ca);
-      m_aset_count++;
-      cntviz += cv;
+      cntviz += updateCount(das);
     }
   }
   if (m_method_param) {
@@ -497,12 +490,7 @@ void DexAnnotationDirectory::calc_internals() {
       m_xref_count++;
       for (auto const& pp : *pa) {
         DexAnnotationSet* das = pp.second;
-        int ca, cv;
-        das->viz_counts(ca, cv);
-        m_anno_count += ca;
-        m_aset_size += 4 + 4 * (ca);
-        m_aset_count++;
-        cntviz += cv;
+        cntviz += updateCount(das);
       }
     }
   }
@@ -602,13 +590,13 @@ void DexAnnotationDirectory::vencode(
     classoff = asetmap[m_class];
   }
   if (m_field) {
-    cntaf = m_field->size();
+    cntaf = (uint32_t) m_field->size();
   }
   if (m_method) {
-    cntam = m_method->size();
+    cntam = (uint32_t) m_method->size();
   }
   if (m_method_param) {
-    cntamp = m_method_param->size();
+    cntamp = (uint32_t) m_method_param->size();
   }
   annodirout.push_back(classoff);
   annodirout.push_back(cntaf);
@@ -663,7 +651,7 @@ void DexAnnotationSet::gather_annotations(std::vector<DexAnnotation*>& list) {
 void DexAnnotationSet::vencode(DexOutputIdx* dodx,
                                std::vector<uint32_t>& asetout,
                                std::map<DexAnnotation*, uint32_t>& annoout) {
-  asetout.push_back(m_annotations.size());
+  asetout.push_back((uint32_t) m_annotations.size());
   m_annotations.sort(type_annotation_compare);
   for (auto anno : m_annotations) {
     always_assert_log(annoout.count(anno) != 0,
@@ -684,7 +672,7 @@ static void uleb_append(std::vector<uint8_t>& bytes, uint32_t v) {
 void DexAnnotation::vencode(DexOutputIdx* dodx, std::vector<uint8_t>& bytes) {
   bytes.push_back(m_viz);
   uleb_append(bytes, dodx->typeidx(m_type));
-  uleb_append(bytes, m_anno_elems.size());
+  uleb_append(bytes, (uint32_t) m_anno_elems.size());
   for (auto elem : m_anno_elems) {
     DexString* string = elem.string;
     DexEncodedValue* ev = elem.encoded_value;

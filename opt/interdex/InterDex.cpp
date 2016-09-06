@@ -18,13 +18,15 @@
 #include "Creators.h"
 #include "Debug.h"
 #include "DexClass.h"
+#include "DexInstruction.h"
 #include "DexLoader.h"
 #include "DexOutput.h"
 #include "DexUtil.h"
 #include "ConfigFiles.h"
 #include "ReachableClasses.h"
+#include "StringUtil.h"
 #include "Transform.h"
-#include "walkers.h"
+#include "Walkers.h"
 
 namespace {
 
@@ -39,6 +41,9 @@ size_t global_fieldref_cnt;
 size_t global_cls_cnt;
 size_t cls_skipped_in_primary = 0;
 size_t cls_skipped_in_secondary = 0;
+size_t cold_start_set_dex_count = 1000;
+
+bool emit_canaries = false;
 
 static void gather_mrefs(DexClass* cls, mrefs_t& mrefs, frefs_t& frefs) {
   std::vector<DexMethod*> method_refs;
@@ -56,13 +61,13 @@ static const int kMaxLinearAlloc = (11600 * 1024);
 #endif
 static const int kMaxMethodRefs = ((64 * 1024) - 1);
 static const int kMaxFieldRefs = 64 * 1024 - 1;
-static const char* kCanaryPrefix = "Lsecondary/dex";
-static const char* kCanaryClassFormat = "Lsecondary/dex%02d/Canary;";
-static const int kCanaryClassBufsize = strlen(kCanaryClassFormat) + 1;
+static const char kCanaryPrefix[] = "Lsecondary/dex";
+static const char kCanaryClassFormat[] = "Lsecondary/dex%02d/Canary;";
+static const size_t kCanaryClassBufsize = sizeof(kCanaryClassFormat);
 static const int kMaxDexNum = 99;
 
 struct dex_emit_tracker {
-  int la_size;
+  unsigned la_size;
   mrefs_t mrefs;
   frefs_t frefs;
   std::vector<DexClass*> outs;
@@ -132,23 +137,36 @@ static void flush_out_secondary(
     DexClassesVector &outdex,
     size_t mrefs_size,
     size_t frefs_size) {
+  // don't emit dex if we don't have any classes
+  if (!det.outs.size()) {
+    return;
+  }
   /* Find the Canary class and add it in. */
-  int dexnum = ((int)outdex.size());
-  char buf[kCanaryClassBufsize];
-  always_assert_log(dexnum <= kMaxDexNum,
-                    "Bailing, Max dex number surpassed %d\n", dexnum);
-  snprintf(buf, sizeof(buf), kCanaryClassFormat, dexnum);
-  std::string canaryname(buf);
-  auto it = det.clookup.find(canaryname);
-  if (it == det.clookup.end()) {
-    fprintf(stderr, "Warning, no canary class %s found\n", buf);
-    ClassCreator cc(DexType::make_type(canaryname.c_str()));
-    cc.set_access(ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT);
-    cc.set_super(get_object_type());
-    det.outs.push_back(cc.create());
-  } else {
-    auto clazz = it->second;
-    det.outs.push_back(clazz);
+  if (emit_canaries) {
+    int dexnum = ((int)outdex.size());
+    char buf[kCanaryClassBufsize];
+    always_assert_log(dexnum <= kMaxDexNum,
+                      "Bailing, Max dex number surpassed %d\n", dexnum);
+    snprintf(buf, sizeof(buf), kCanaryClassFormat, dexnum);
+    std::string canaryname(buf);
+    auto it = det.clookup.find(canaryname);
+    if (it == det.clookup.end()) {
+      TRACE(IDEX, 1, "Warning, no canary class %s found\n", buf);
+      auto canary_type = DexType::make_type(canaryname.c_str());
+      auto canary_cls = type_class(canary_type);
+      if (canary_cls == nullptr) {
+        // class doesn't exist, we have to create it
+        // this can happen if we grow the number of dexes
+        ClassCreator cc(canary_type);
+        cc.set_access(ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT);
+        cc.set_super(get_object_type());
+        canary_cls = cc.create();
+      }
+      det.outs.push_back(canary_cls);
+    } else {
+      auto clazz = it->second;
+      det.outs.push_back(clazz);
+    }
   }
 
   /* Now emit our outs list... */
@@ -158,7 +176,11 @@ static void flush_out_secondary(
 static void flush_out_secondary(
     dex_emit_tracker &det,
     DexClassesVector &outdex) {
-  flush_out_secondary(det, outdex, det.mrefs.size(), det.frefs.size());
+  flush_out_secondary(
+      det,
+      outdex,
+      det.mrefs.size(),
+      det.frefs.size());
 }
 
 static bool is_canary(DexClass* clazz) {
@@ -168,13 +190,75 @@ static bool is_canary(DexClass* clazz) {
   return false;
 }
 
+struct PenaltyPattern {
+  const char* suffix;
+  unsigned penalty;
+
+  PenaltyPattern(const char* str, unsigned pen)
+    : suffix(str),
+      penalty(pen)
+  {}
+};
+
+static const PenaltyPattern kPatterns[] = {
+  { "Layout;", 1500 },
+  { "View;", 1500 },
+  { "ViewGroup;", 1800 },
+  { "Activity;", 1500 },
+};
+
+const unsigned kObjectVtable = 48;
+const unsigned kMethodSize = 52;
+const unsigned kInstanceFieldSize = 16;
+const unsigned kVtableSlotSize = 4;
+
+static bool matches_penalty(const char* str, unsigned& penalty) {
+  for (auto const& pattern : kPatterns) {
+    if (ends_with(str, pattern.suffix)) {
+      penalty = pattern.penalty;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Estimates the linear alloc space consumed by the class at runtime.
+ */
+static unsigned estimate_linear_alloc(DexClass* clazz) {
+  unsigned lasize = 0;
+  /*
+   * VTable guestimate.  Technically we could do better here,
+   * but only so much.  Try to stay bug-compatible with
+   * DalvikStatsTool.
+   */
+  if (!(clazz->get_access() & DEX_ACCESS_INTERFACE)) {
+    unsigned vtablePenalty = kObjectVtable;
+    if (!matches_penalty(clazz->get_type()->get_name()->c_str(), vtablePenalty)
+        && clazz->get_super_class() != nullptr) {
+      /* what?, we could be redexing object some day... :) */
+      matches_penalty(
+          clazz->get_super_class()->get_name()->c_str(), vtablePenalty);
+    }
+    lasize += vtablePenalty;
+    lasize += clazz->get_vmethods().size() * kVtableSlotSize;
+  }
+  /* Dmethods... */
+  lasize += clazz->get_dmethods().size() * kMethodSize;
+  /* Vmethods... */
+  lasize += clazz->get_vmethods().size() * kMethodSize;
+  /* Instance Fields */
+  lasize += clazz->get_ifields().size() * kInstanceFieldSize;
+  return lasize;
+}
+
 static void emit_class(dex_emit_tracker &det, DexClassesVector &outdex,
     DexClass *clazz, bool is_primary) {
   if(det.emitted.count(clazz) != 0)
     return;
   if(is_canary(clazz))
     return;
-  int laclazz = estimate_linear_alloc(clazz);
+  unsigned laclazz = estimate_linear_alloc(clazz);
   auto mrefs_size = det.mrefs.size();
   auto frefs_size = det.frefs.size();
   gather_mrefs(clazz, det.mrefs, det.frefs);
@@ -240,9 +324,9 @@ static std::unordered_set<const DexClass*> find_unrefenced_coldstart_classes(
         }
         return false;
       },
-      [&](DexMethod* meth, DexCode* code) {
+      [&](DexMethod* meth, const DexCode& code) {
         auto base_cls = type_class(meth->get_class());
-        for (auto const& inst : code->get_instructions()) {
+        for (auto const& inst : code.get_instructions()) {
           DexClass* called_cls = nullptr;
           if (inst->has_methods()) {
             auto method_access = static_cast<DexOpcodeMethod*>(inst);
@@ -301,8 +385,9 @@ static DexClassesVector run_interdex(
   const DexClassesVector& dexen,
   ConfigFiles& cfg,
   bool allow_cutting_off_dex,
-  bool static_prune_classes
-) {
+  bool static_prune_classes,
+  bool normal_primary_dex) {
+
   global_dmeth_cnt = 0;
   global_smeth_cnt = 0;
   global_vmeth_cnt = 0;
@@ -333,49 +418,53 @@ static DexClassesVector run_interdex(
 
   DexClassesVector outdex;
 
-  // build a separate lookup table for the primary dex,
-  // since we have to make sure we keep all classes
-  // in the same dex
-  auto const& primary_dex = dexen[0];
-  for (auto const& clazz : primary_dex) {
-    std::string clzname(clazz->get_type()->get_name()->c_str());
-    primary_det.clookup[clzname] = clazz;
-  }
+  // We have a bunch of special logic for the primary dex
+  // which we only use if we can't touch the primary dex.
+  if (!normal_primary_dex) {
+    // build a separate lookup table for the primary dex,
+    // since we have to make sure we keep all classes
+    // in the same dex
+    auto const& primary_dex = dexen[0];
+    for (auto const& clazz : primary_dex) {
+      std::string clzname(clazz->get_type()->get_name()->c_str());
+      primary_det.clookup[clzname] = clazz;
+    }
 
-  /* First emit just the primary dex, but sort it
-   * according to interdex order
-   **/
-  primary_det.la_size = 0;
-  // first add the classes in the interdex list
-  auto coldstart_classes_in_primary = 0;
-  for (auto& entry : interdexorder) {
-    auto it = primary_det.clookup.find(entry);
-    if (it == primary_det.clookup.end()) {
-      TRACE(IDEX, 4, "No such entry %s\n", entry.c_str());
-      continue;
+    /* First emit just the primary dex, but sort it
+     * according to interdex order
+     **/
+    primary_det.la_size = 0;
+    // first add the classes in the interdex list
+    auto coldstart_classes_in_primary = 0;
+    for (auto& entry : interdexorder) {
+      auto it = primary_det.clookup.find(entry);
+      if (it == primary_det.clookup.end()) {
+        TRACE(IDEX, 4, "No such entry %s\n", entry.c_str());
+        continue;
+      }
+      auto clazz = it->second;
+      if (unreferenced_classes.count(clazz)) {
+        TRACE(IDEX, 3, "%s no longer linked to coldstart set.\n", SHOW(clazz));
+        cls_skipped_in_primary++;
+        continue;
+      }
+      emit_class(primary_det, outdex, clazz, true);
+      coldstart_classes_in_primary++;
     }
-    auto clazz = it->second;
-    if (unreferenced_classes.count(clazz)) {
-      TRACE(IDEX, 3, "%s no longer linked to coldstart set.\n", SHOW(clazz));
-      cls_skipped_in_primary++;
-      continue;
+    // now add the rest
+    for (auto const& clazz : primary_dex) {
+      emit_class(primary_det, outdex, clazz, true);
     }
-    emit_class(primary_det, outdex, clazz, true);
-    coldstart_classes_in_primary++;
-  }
-  // now add the rest
-  for (auto const& clazz : primary_dex) {
-    emit_class(primary_det, outdex, clazz, true);
-  }
-  TRACE(IDEX, 1,
-      "%d out of %lu classes in primary dex in interdex list\n",
-      coldstart_classes_in_primary,
-      primary_det.outs.size());
-  flush_out_dex(primary_det, outdex);
-  // record the primary dex classes in the main emit tracker,
-  // so we don't emit those classes again. *cough*
-  for (auto const& clazz : primary_dex) {
-    det.emitted.insert(clazz);
+    TRACE(IDEX, 1,
+        "%d out of %lu classes in primary dex in interdex list\n",
+        coldstart_classes_in_primary,
+        primary_det.outs.size());
+    flush_out_dex(primary_det, outdex);
+    // record the primary dex classes in the main emit tracker,
+    // so we don't emit those classes again. *cough*
+    for (auto const& clazz : primary_dex) {
+      det.emitted.insert(clazz);
+    }
   }
 
   det.la_size = 0;
@@ -414,6 +503,9 @@ static DexClassesVector run_interdex(
     }
   }
 
+  // -1 because we're not counting the primary dex
+  cold_start_set_dex_count = outdex.size();
+
   /* Now emit the kerf that wasn't specified in the head
    * or primary list.
    */
@@ -443,24 +535,19 @@ static DexClassesVector run_interdex(
   return outdex;
 }
 
+} // End namespace
+
+
+void InterDexPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg, PassManager& mgr) {
+  emit_canaries = m_emit_canaries;
+  dexen = run_interdex(dexen, cfg, true, m_static_prune, m_normal_primary_dex);
+  mgr.incr_metric(METRIC_COLD_START_SET_DEX_COUNT, cold_start_set_dex_count);
 }
 
-void InterDexPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
-
-  bool static_prune = false;
-  if (m_config["static_prune"] != nullptr) {
-    auto prune_str = m_config["static_prune"].asString().toStdString();
-    if (prune_str == "1") {
-      static_prune = true;
+void InterDexPass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  for (auto& store : stores) {
+    if (store.get_name() == "classes") {
+      run_pass(store.get_dexen(), cfg, mgr);
     }
-  }
-
-  auto first_attempt = run_interdex(dexen, cfg, true, static_prune);
-  if (first_attempt.size() > dexen.size()) {
-    fprintf(stderr, "Warning, Interdex grew the number of dexes from %lu to %lu! \n \
-        Retrying without cutting off interdex dexes. \n", dexen.size(), first_attempt.size());
-    dexen = run_interdex(dexen, cfg, false, static_prune);
-  } else {
-    dexen = std::move(first_attempt);
   }
 }

@@ -22,7 +22,7 @@
 #include "Resolver.h"
 #include "ConfigFiles.h"
 #include "ReachableClasses.h"
-#include "walkers.h"
+#include "Walkers.h"
 #include "Warning.h"
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -147,8 +147,8 @@ std::vector<DexMethod*> get_noncoldstart_statics(
       if ((method->get_access() & ACC_STATIC)) {
         if (!is_clinit(method) &&
             coldstart_methods.count(method) == 0 &&
-            do_not_strip(cls) &&
-            do_not_strip(method)) {
+            can_delete(cls) &&
+            can_delete(method)) {
           noncold_methods.push_back(method);
         } else {
           keep_statics++;
@@ -169,9 +169,9 @@ void remove_primary_dex_refs(
   walk_opcodes(
     primary_dex,
     [](DexMethod*) { return true; },
-    [&](DexMethod*, DexOpcode* op) {
-      if (op->has_methods()) {
-        auto callee = static_cast<DexOpcodeMethod*>(op)->get_method();
+    [&](DexMethod*, DexInstruction* insn) {
+      if (insn->has_methods()) {
+        auto callee = static_cast<DexOpcodeMethod*>(insn)->get_method();
         ref_set.insert(callee);
       }
     }
@@ -232,7 +232,7 @@ bool allow_type_access(DexType* type) {
 }
 
 bool illegal_access(DexMethod* method) {
-  auto code = method->get_code();
+  auto& code = method->get_code();
   if (!code) {
     return true;
   }
@@ -303,9 +303,11 @@ DexClass* move_statics_out(
     }
     TRACE(SINK, 2, "sink %s to %s\n", SHOW(meth), SHOW(sink_class));
     type_class(meth->get_class())->get_dmethods().remove(meth);
-    meth->change_class(sink_class->get_type());
+    DexMethodRef ref;
+    ref.cls = sink_class->get_type();
+    meth->change(ref);
     set_public(meth);
-    insert_sorted(sink_class->get_dmethods(), meth, compare_dexmethods);
+    sink_class->add_method(meth);
     moved_count++;
   }
 
@@ -320,22 +322,22 @@ DexClass* move_statics_out(
 }
 
 std::unordered_map<DexMethod*, DexClass*> get_sink_map(
-    const DexClassesVector& dexen,
+    DexStoresVector& stores,
     const std::vector<DexClass*>& classes,
     const std::vector<DexMethod*>& statics) {
   std::unordered_map<DexMethod*, DexClass*> statics_to_callers;
   std::unordered_set<DexClass*> class_set(classes.begin(), classes.end());
   std::unordered_set<DexMethod*> static_set(statics.begin(), statics.end());
-  auto scope = build_class_scope(dexen);
+  auto scope = build_class_scope(stores);
   walk_opcodes(
     scope,
     [&](DexMethod* m) {
       auto cls = type_class(m->get_class());
       return class_set.count(cls) == 0 && is_public(cls);
     },
-    [&](DexMethod* m, DexOpcode* op) {
-      if (op->has_methods()) {
-        auto callee = static_cast<DexOpcodeMethod*>(op)->get_method();
+    [&](DexMethod* m, DexInstruction* insn) {
+      if (insn->has_methods()) {
+        auto callee = static_cast<DexOpcodeMethod*>(insn)->get_method();
         if (static_set.count(callee)) {
           statics_to_callers[callee] = type_class(m->get_class());
         }
@@ -365,22 +367,23 @@ void count_coldstart_statics(const std::vector<DexClass*>& classes) {
 
 }
 
-void StaticSinkPass::run_pass(DexClassesVector& dexen, ConfigFiles& cfg) {
+void StaticSinkPass::run_pass(DexStoresVector& stores, ConfigFiles& cfg, PassManager& mgr) {
+  DexClassesVector& root_store = stores[0].get_dexen();
   auto method_list = cfg.get_coldstart_methods();
   auto methods = strings_to_dexmethods(method_list);
   TRACE(SINK, 1, "methods used in coldstart: %lu\n", methods.size());
-  auto coldstart_classes = get_coldstart_classes(dexen, cfg);
+  auto coldstart_classes = get_coldstart_classes(root_store, cfg);
   count_coldstart_statics(coldstart_classes);
   auto statics = get_noncoldstart_statics(coldstart_classes, methods);
   TRACE(SINK, 1, "statics not used in coldstart: %lu\n", statics.size());
-  remove_primary_dex_refs(dexen[0], statics);
+  remove_primary_dex_refs(root_store[0], statics);
   TRACE(SINK, 1, "statics after removing primary dex: %lu\n", statics.size());
-  auto sink_map = get_sink_map(dexen, coldstart_classes, statics);
+  auto sink_map = get_sink_map(stores, coldstart_classes, statics);
   TRACE(SINK, 1, "statics with sinkable callsite: %lu\n", sink_map.size());
   auto holder = move_statics_out(statics, sink_map);
   TRACE(SINK, 1, "methods in static holder: %lu\n",
           holder->get_dmethods().size());
   DexClasses dc(1);
   dc.insert_at(holder, 0);
-  dexen.emplace_back(std::move(dc));
+  root_store.emplace_back(std::move(dc));
 }

@@ -13,13 +13,14 @@
 #include "Trace.h"
 
 bool load_proguard_config_file(const char *location, std::vector<KeepRule>* rules,
-                               std::vector<std::string>* library_jars) {
+                               std::set<std::string>* library_jars) {
   TRACE(MAIN, 1, "Loading ProGuard configuration from %s\n", location);
   parse_proguard_file(location, rules, library_jars);
   if (rules->empty()) {
     fprintf(stderr, "couldn't parse Proguard rules\n");
     return false;
   } else {
+    TRACE(PGR, 1, "Loaded %d ProGuard rules\n", rules->size());
     return true;
   }
 }

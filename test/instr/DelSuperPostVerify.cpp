@@ -14,41 +14,15 @@
 #include <gtest/gtest.h>
 #include <string>
 
-#include <folly/json.h>
-#include <folly/dynamic.h>
-
-#include "DexClass.h"
-#include "DexOpcode.h"
-#include "DexLoader.h"
+#include "DexInstruction.h"
 #include "Match.h"
-#include "RedexContext.h"
-
-DexClass* find_class_named(const DexClasses& classes, const char* name) {
-  auto it = std::find_if(classes.begin(), classes.end(), [&name](DexClass* cls){
-    return !strcmp(
-      name,
-      cls->get_name()->c_str());
-  });
-  if (it == classes.end()) {
-    return nullptr;
-  } else {
-    return *it;
-  }
-}
+#include "VerifyUtil.h"
 
 /**
  * Ensure the structures in DelSuperTest.java are as expected
  * following a redex transformation.
  */
-TEST(PostVerify, DelSuper) {
-  g_redex = new RedexContext();
-
-  const char* dexfile = std::getenv("dexfile");
-  ASSERT_NE(nullptr, dexfile);
-
-  std::vector<DexClasses> dexen;
-  dexen.emplace_back(load_classes_from_dex(dexfile));
-  DexClasses& classes = dexen.back();
+TEST_F(PostVerify, DelSuper) {
   std::cout << "Loaded classes: " << classes.size() << std::endl ;
 
   // Should have C1 and 2 C2 still
@@ -77,5 +51,21 @@ TEST(PostVerify, DelSuper) {
   ASSERT_TRUE(m3.matches(c1));
   ASSERT_TRUE(m3.matches(c2));
 
-  delete g_redex;
+  // check that the invoke instructions are fixed up as well
+  auto test_class = find_class_named(
+    classes, "Lcom/facebook/redex/test/instr/DelSuperTest;");
+  auto test_opt_1 = find_vmethod_named(*test_class, "testOptimized1");
+  int optimized1_count = 0;
+  for (auto& insn : test_opt_1->get_code()->get_instructions()) {
+    if (is_invoke(insn->opcode())) {
+      auto mop = static_cast<DexOpcodeMethod*>(insn);
+      auto m = mop->get_method();
+      if (strcmp(m->get_name()->c_str(), "optimized1") == 0) {
+        ASSERT_STREQ(m->get_class()->get_name()->c_str(),
+                     "Lcom/facebook/redex/test/instr/DelSuperTest$C1;");
+        ++optimized1_count;
+      }
+    }
+  }
+  ASSERT_EQ(optimized1_count, 3);
 }
